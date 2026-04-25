@@ -12,6 +12,7 @@ env:
 
 permissions:
   contents: write   # needed to create a release and upload assets
+  packages: write   # needed to push Docker images to GHCR
 
 jobs:
   # ── Cross-compile binaries for every supported target ────────────────────────
@@ -116,3 +117,77 @@ jobs:
           # Create the release automatically if it doesn't exist yet
           # (e.g. when the tag was pushed directly rather than through the UI).
           generate_release_notes: true
+
+      # Upload gzip'd binaries as workflow artifacts so the docker job can
+      # reuse them without re-building.  Only the two Linux-glibc targets
+      # are needed for the multi-platform Docker image.
+      - name: Upload artifact for Docker build
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.gz
+          retention-days: 1
+
+  # ── Build and push multi-platform Docker image ───────────────────────────────
+  docker:
+    name: Docker build and push
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download amd64 binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: dist-x86_64
+
+      - name: Download arm64 binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: release-aarch64-unknown-linux-gnu
+          path: dist-aarch64
+
+      - name: Prepare binaries for Docker build
+        run: |
+          mkdir -p dist
+          gunzip -c dist-x86_64/expose-server-x86_64-unknown-linux-gnu.gz > dist/expose-server-amd64
+          gunzip -c dist-x86_64/expose-client-x86_64-unknown-linux-gnu.gz > dist/expose-client-amd64
+          gunzip -c dist-aarch64/expose-server-aarch64-unknown-linux-gnu.gz > dist/expose-server-arm64
+          gunzip -c dist-aarch64/expose-client-aarch64-unknown-linux-gnu.gz > dist/expose-client-arm64
+          chmod +x dist/*
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
