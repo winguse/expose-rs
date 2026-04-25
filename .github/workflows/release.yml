@@ -1,0 +1,99 @@
+name: Release
+
+# Trigger on any tag that looks like a semantic version.
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write   # needed to create a release and upload assets
+
+jobs:
+  # ── Cross-compile binaries for every supported target ────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native Linux x86_64 — no cross-compiler needed
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: false
+
+          # Linux aarch64 with glibc — cross via Docker
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: true
+
+          # Linux aarch64 with musl (fully static) — cross via Docker
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
+
+          # Linux MIPS LE with musl (OpenWrt / embedded) — cross via Docker
+          - target: mipsel-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
+
+          # macOS Apple Silicon — native arm64 runner
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Install `cross` only on Linux jobs that need it.
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build expose-server
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p expose-server
+          else
+            cargo build --release --target ${{ matrix.target }} -p expose-server
+          fi
+
+      - name: Build expose-client
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p expose-client
+          else
+            cargo build --release --target ${{ matrix.target }} -p expose-client
+          fi
+
+      - name: Package binaries as gzip
+        shell: bash
+        run: |
+          mkdir -p dist
+          gzip -9 -c target/${{ matrix.target }}/release/expose-server \
+            > dist/expose-server-${{ matrix.target }}.gz
+          gzip -9 -c target/${{ matrix.target }}/release/expose-client \
+            > dist/expose-client-${{ matrix.target }}.gz
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.gz
+          # Create the release automatically if it doesn't exist yet
+          # (e.g. when the tag was pushed directly rather than through the UI).
+          generate_release_notes: true
