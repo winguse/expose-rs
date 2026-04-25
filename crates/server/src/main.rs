@@ -538,6 +538,8 @@ fn build_streaming_response(
 
     let stream = futures_util::stream::unfold(body_rx, |mut rx| async move {
         let chunk = rx.recv().await?;
+        // The protocol sends a final chunk with done=true and empty data to signal end of stream.
+        // We stop the stream here without emitting that sentinel frame as HTTP body data.
         if chunk.done {
             return None;
         }

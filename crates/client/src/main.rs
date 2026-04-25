@@ -23,6 +23,29 @@ struct Args {
     upstream: String,
 }
 
+/// Hop-by-hop headers that must not be forwarded in HTTP proxy requests.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "upgrade",
+    "transfer-encoding",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+];
+
+/// WebSocket handshake headers managed by the client library; must not be forwarded.
+const WS_HANDSHAKE_HEADERS: &[&str] = &[
+    "connection",
+    "upgrade",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
+];
+
 /// Shared sender for the control WebSocket connection.
 type TunnelTx = mpsc::Sender<TunnelMessage>;
 
@@ -216,13 +239,7 @@ async fn handle_http_request(
     let mut request_builder = http_client.request(method_parsed, &url);
 
     for (name, values) in &req_headers {
-        // Skip hop-by-hop headers.
-        if matches!(
-            name.as_str(),
-            "connection" | "upgrade" | "transfer-encoding" | "keep-alive"
-                | "proxy-connection" | "proxy-authenticate" | "proxy-authorization"
-                | "te" | "trailers"
-        ) {
+        if HOP_BY_HOP_HEADERS.contains(&name.as_str()) {
             continue;
         }
         if let Ok(header_name) = HeaderName::from_str(name) {
@@ -366,7 +383,7 @@ async fn handle_ws_open(
     let mut ws_request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
         .uri(upstream_url.as_str());
     for (name, values) in &req_headers {
-        if matches!(name.as_str(), "connection" | "upgrade" | "sec-websocket-key" | "sec-websocket-version") {
+        if WS_HANDSHAKE_HEADERS.contains(&name.as_str()) {
             continue;
         }
         for value in values {
