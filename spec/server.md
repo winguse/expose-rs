@@ -13,40 +13,29 @@ Options:
 
 ## Behavior
 
-1. Starts an axum HTTP server on `<host>:<port>`.
-2. `GET /<secret-token>` — WebSocket upgrade endpoint for tunnel clients.
-3. All other routes — HTTP proxy to the connected tunnel client.
+1. Opens a raw `TcpListener` on `<host>:<port>`.
+2. For every incoming TCP connection, peeks at the first bytes to check whether it is the tunnel client.
+   - **Tunnel client**: HTTP `GET /<secret-token> HTTP/1.x` WebSocket upgrade → perform WebSocket handshake, set up tunnel.
+   - **Proxied connection**: any other byte stream → assign a `conn_id`, forward raw bytes through the tunnel.
 
 ## Tunnel Client Management
 
 - Only one tunnel client may be connected at a time.
-- When a new client connects, the previous client connection is closed.
-- The server maintains `Arc<Mutex<Option<ClientHandle>>>` shared state.
+- When a new client connects, the previous client's sender is replaced and all tracked connections are cleared.
+- The tunnel transport is a binary WebSocket connection (see `spec/protocol.md`).
 
-## Request Proxying
+## Proxied Connection Flow
 
-For every incoming HTTP request (non-tunnel):
+For every non-tunnel TCP connection:
 
-1. Generate a UUID for the request.
-2. Register a oneshot channel in the pending-requests map keyed by UUID.
-3. Send an `HttpRequest` message to the client.
-4. Await response on the oneshot channel with a 30-second timeout.
-5. Return the resulting HTTP response (or 504 on timeout, 502 on no client).
-
-## Streaming
-
-When the client responds with `HttpResponseChunk`, the server begins streaming the body back to the original caller as it receives `HttpResponseBodyChunk` frames until `done: true`.
-
-## WebSocket Proxying
-
-When the incoming request contains a WebSocket upgrade header:
-
-1. Send `WsOpen` to the client.
-2. Relay `WsData` frames bidirectionally.
-3. Send `WsClose` when either side closes.
+1. Assign a monotonically increasing `conn_id` (u32, wraps).
+2. Send an `OPEN` frame to the tunnel client.
+3. Spawn two tasks:
+   - **Reader**: read from the TCP socket, send `DATA` frames through the tunnel.
+   - **Writer**: receive `DATA` frames from the tunnel, write to the TCP socket.
+4. When either side closes, send a `CLOSE` frame and clean up the connection entry.
 
 ## Error Handling
 
-- 502 Bad Gateway when no client is connected.
-- 504 Gateway Timeout when the request times out (30 s).
-- Connection errors logged and cleaned up gracefully.
+- If no tunnel client is connected when a proxied connection arrives, the TCP connection is dropped immediately.
+- If the tunnel client disconnects, all active proxied connections are cleaned up.

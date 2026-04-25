@@ -6,40 +6,44 @@
 expose-client [OPTIONS]
 
 Options:
-  --server <URL>      Server WebSocket URL (e.g. wss://host/secret) [required]
-  --upstream <URL>    Upstream HTTP base URL (e.g. http://localhost:3000) [required]
+  --server <URL>        Tunnel server WebSocket URL (e.g. ws://host:8080/secret or wss://host/secret) [required]
+  --upstream <ADDR>     Upstream TCP address to forward connections to (e.g. localhost:3000) [required]
 ```
 
 ## Behavior
 
-1. Connects to the server WebSocket URL.
-2. Loops receiving messages and dispatches each concurrently.
+1. Connects to the server tunnel endpoint via WebSocket (supports ws:// and wss://).
+2. Receives binary tunnel frames and dispatches them.
 3. Reconnects on disconnect with exponential backoff (1 s → 2 s → 4 s … max 60 s).
 
-## HttpRequest Handling
+## OPEN Frame Handling
 
-1. Reconstruct the full upstream URL from `--upstream` base + `path` from the message.
-2. Issue an HTTP request using `reqwest`.
-3. Inspect the response `content-type` header.
-   - If `text/event-stream` (SSE) or any streaming response: use chunked protocol.
-   - Otherwise: read full body, send `HttpResponse`.
+When an `OPEN` frame is received for `conn_id`:
 
-## Streaming Response
+1. Register the connection immediately as `Connecting` (buffering subsequent DATA frames).
+2. Spawn a task to `TcpStream::connect(upstream)`.
+3. On success: flush buffered DATA, transition state to `Connected`, relay data bidirectionally.
+4. On failure: remove entry, send `CLOSE` frame back to server.
 
-1. Send `HttpResponseChunk` with status and headers.
-2. Stream body chunks as `HttpResponseBodyChunk { data, done: false }`.
-3. Send final `HttpResponseBodyChunk { data: "", done: true }`.
+## DATA Frame Handling
 
-## WebSocket Proxying
+- If connection is `Connecting`: append payload to buffer.
+- If connection is `Connected`: send payload into the upstream writer channel.
+- If connection is unknown: log a warning and discard.
 
-When `WsOpen` is received:
+## CLOSE Frame Handling
 
-1. Connect to upstream WebSocket at the given path.
-2. Relay `WsData` frames in both directions using separate tasks.
-3. Send `WsClose` to server when the upstream WebSocket closes.
-4. Close upstream WebSocket when `WsClose` is received from server.
+Remove the connection entry from the map (the writer task will notice the channel is closed and shut down the upstream TCP socket).
+
+## Per-Connection Flow
+
+For each upstream TCP connection:
+
+- **Reader task**: read from upstream TCP, send `DATA` frames to server, send `CLOSE` on EOF/error.
+- **Writer task**: receive `DATA` payloads, write to upstream TCP, shutdown on channel close.
 
 ## Error Handling
 
-- Log errors and send a 502 `HttpResponse` when upstream request fails.
-- Backoff-based reconnection to server on connection loss.
+- Upstream connection failure: send `CLOSE` back to server.
+- Tunnel WebSocket error: log and reconnect with backoff.
+- All connection entries are cleared on tunnel disconnect.

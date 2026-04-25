@@ -1,114 +1,59 @@
 # Protocol Design
 
-All messages are sent as WebSocket **text frames**, JSON-encoded.
+The server and client communicate over a **WebSocket** connection (for TLS and proxy traversal support), using **binary WebSocket frames** only. Each binary WebSocket message carries exactly one tunnel frame.
 
-## Message Types
+## Binary Frame Format
 
-### Server → Client: HttpRequest
+All integers are big-endian.
 
-Sent when a new HTTP request arrives at the server that needs to be proxied.
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "type": "HttpRequest",
-  "method": "GET",
-  "path": "/some/path?query=value",
-  "headers": {
-    "host": ["example.com"],
-    "accept": ["*/*"]
-  },
-  "body": null
-}
+```
++──────────────────+──────────────+────────────────────+──────────────────+
+│  conn_id  (4 B)  │  type  (1 B) │  payload_len  (4 B) │  payload  (N B)  │
++──────────────────+──────────────+────────────────────+──────────────────+
 ```
 
-`body` is base64-encoded or `null` for bodyless requests.
+Total header size: **9 bytes**.
 
-### Client → Server: HttpResponse
+### Field definitions
 
-Sent in response to an HttpRequest (non-streaming).
+| Field         | Size   | Description                                    |
+|---------------|--------|------------------------------------------------|
+| `conn_id`     | 4 B    | Unique connection identifier (assigned by server, wraps around) |
+| `type`        | 1 B    | Frame type (see below)                         |
+| `payload_len` | 4 B    | Length of the payload in bytes                 |
+| `payload`     | N B    | Raw bytes (empty for OPEN and CLOSE)           |
 
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "type": "HttpResponse",
-  "status": 200,
-  "headers": {
-    "content-type": ["text/html"]
-  },
-  "body": "PGh0bWw+..."
-}
+## Frame Types
+
+| Value  | Name    | Direction          | Description                                           |
+|--------|---------|--------------------|-------------------------------------------------------|
+| `0x01` | `OPEN`  | Server → Client    | A new TCP connection has been accepted by the server. |
+| `0x02` | `DATA`  | Bidirectional      | Raw TCP bytes for the identified connection.          |
+| `0x03` | `CLOSE` | Bidirectional      | The TCP connection has been (or should be) closed.   |
+
+## Flow
+
+```
+External client          expose-server          expose-client         Upstream TCP
+      │                       │                       │                     │
+      │──── TCP connect ──────▶│                       │                     │
+      │                       │── OPEN(conn_id=1) ────▶│                     │
+      │                       │                       │──── TCP connect ────▶│
+      │──── bytes ────────────▶│                       │                     │
+      │                       │── DATA(conn_id=1, …) ─▶│                     │
+      │                       │                       │──── bytes ──────────▶│
+      │                       │                       │◀─── bytes ───────────│
+      │                       │◀─ DATA(conn_id=1, …) ──│                     │
+      │◀─── bytes ─────────────│                       │                     │
+      │──── TCP close ─────────▶│                       │                     │
+      │                       │── CLOSE(conn_id=1) ───▶│                     │
+      │                       │                       │──── TCP close ───────▶│
 ```
 
-### Client → Server: HttpResponseChunk (streaming first frame)
+## Design properties
 
-Sent when the upstream response is streaming (e.g., SSE). Carries status and headers.
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "type": "HttpResponseChunk",
-  "status": 200,
-  "headers": {
-    "content-type": ["text/event-stream"]
-  }
-}
-```
-
-### Client → Server: HttpResponseBodyChunk (streaming data frame)
-
-Subsequent frames carrying streamed body data.
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "type": "HttpResponseBodyChunk",
-  "data": "ZGF0YTogaGVsbG8K",
-  "done": false
-}
-```
-
-When `done` is `true`, `data` is empty and the stream is complete.
-
-### Server → Client: WsOpen
-
-Sent when an incoming HTTP connection is a WebSocket upgrade request.
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "type": "WsOpen",
-  "path": "/ws-path",
-  "headers": {
-    "sec-websocket-protocol": ["chat"]
-  }
-}
-```
-
-### Server → Client / Client → Server: WsData
-
-Carries a WebSocket message frame in either direction.
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "type": "WsData",
-  "data": "aGVsbG8=",
-  "is_binary": false
-}
-```
-
-### Server → Client / Client → Server: WsClose
-
-Signals WebSocket connection closure.
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "type": "WsClose"
-}
-```
-
-## Multiplexing
-
-Multiple HTTP requests and WebSocket sessions are multiplexed over the single control WebSocket. The `id` field uniquely identifies each request/session, allowing concurrent in-flight requests.
+- **Protocol neutral**: the server and client relay raw TCP byte streams; neither inspects the application protocol (HTTP, WebSocket, gRPC, SSH, etc.).
+- **Binary encoding**: no JSON, no base64; frames are compact binary.
+- **Multiplexed**: many TCP connections are multiplexed over the single tunnel WebSocket.
+- **Buffering**: the client buffers DATA frames that arrive while the upstream TCP connection is being established.
+- **Single tunnel**: the server allows only one tunnel client at a time; a new connection atomically replaces the previous one.

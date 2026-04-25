@@ -1,53 +1,43 @@
 use clap::Parser;
-use expose_common::{decode_base64, encode_base64, Headers, TunnelMessage};
+use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
 use futures_util::{SinkExt, StreamExt};
-use reqwest::header::{HeaderName, HeaderValue};
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
     sync::{mpsc, Mutex},
     time::sleep,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
-use url::Url;
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "expose-rs client")]
+#[command(author, version, about = "expose-rs client — protocol-neutral TCP tunnel")]
 struct Args {
-    /// Server WebSocket URL (e.g. ws://host:8080/secret or wss://host/secret)
+    /// Server WebSocket URL (e.g. ws://host:8080/secret-token or wss://host/secret-token).
     #[arg(long)]
     server: String,
 
-    /// Upstream HTTP base URL (e.g. http://localhost:3000)
+    /// Upstream TCP address to forward connections to (e.g. localhost:3000).
     #[arg(long)]
     upstream: String,
 }
 
-/// Hop-by-hop headers that must not be forwarded in HTTP proxy requests.
-const HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "upgrade",
-    "transfer-encoding",
-    "keep-alive",
-    "proxy-connection",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-];
+// ── Connection state on the client side ──────────────────────────────────────
 
-/// WebSocket handshake headers managed by the client library; must not be forwarded.
-const WS_HANDSHAKE_HEADERS: &[&str] = &[
-    "connection",
-    "upgrade",
-    "sec-websocket-key",
-    "sec-websocket-version",
-    "sec-websocket-extensions",
-    "sec-websocket-protocol",
-];
+/// State of a proxied connection.
+enum ConnEntry {
+    /// TCP connection to upstream is being established; DATA frames are buffered.
+    Connecting(Vec<Vec<u8>>),
+    /// TCP connection is ready; DATA frames go directly into the channel.
+    Connected(mpsc::Sender<Vec<u8>>),
+}
 
-/// Shared sender for the control WebSocket connection.
-type TunnelTx = mpsc::Sender<TunnelMessage>;
+type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
@@ -59,17 +49,15 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let upstream = args.upstream.trim_end_matches('/').to_string();
-
     let mut backoff = Duration::from_secs(1);
 
     loop {
         info!("Connecting to server: {}", args.server);
         match connect_async(&args.server).await {
-            Ok((ws_stream, _)) => {
-                info!("Connected to server");
+            Ok((ws, _)) => {
                 backoff = Duration::from_secs(1);
-                run_client(ws_stream, upstream.clone()).await;
+                info!("Connected to server");
+                run_client(ws, args.upstream.clone()).await;
                 warn!("Disconnected from server, reconnecting...");
             }
             Err(e) => {
@@ -81,66 +69,39 @@ async fn main() {
     }
 }
 
+// ── Main client loop ──────────────────────────────────────────────────────────
+
 async fn run_client(
-    ws_stream: tokio_tungstenite::WebSocketStream<
+    ws: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     upstream: String,
 ) {
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<TunnelMessage>(256);
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(512);
 
-    // Writer task: send outgoing tunnel messages.
+    // Writer task: send outgoing binary frames to the server.
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            match serde_json::to_string(&msg) {
-                Ok(text) => {
-                    if ws_tx
-                        .send(Message::Text(text.into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(e) => error!("Serialize error: {}", e),
+        while let Some(bytes) = out_rx.recv().await {
+            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+                break;
             }
         }
+        let _ = ws_tx.close().await;
     });
 
-    // WebSocket sessions: map from session id -> sender to the upstream ws forwarder.
-    let ws_sessions: Arc<Mutex<HashMap<String, mpsc::Sender<WsFrame>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let conn_map: ConnMap = Arc::new(Mutex::new(HashMap::new()));
 
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .unwrap();
-
+    // Main receive loop.
     while let Some(msg_result) = ws_rx.next().await {
         match msg_result {
-            Ok(Message::Text(text)) => {
-                match serde_json::from_str::<TunnelMessage>(&text) {
-                    Ok(tunnel_msg) => {
-                        let out_tx = out_tx.clone();
-                        let upstream = upstream.clone();
-                        let http_client = http_client.clone();
-                        let ws_sessions = Arc::clone(&ws_sessions);
-
-                        tokio::spawn(async move {
-                            handle_tunnel_message(
-                                tunnel_msg,
-                                out_tx,
-                                upstream,
-                                http_client,
-                                ws_sessions,
-                            )
-                            .await;
-                        });
-                    }
-                    Err(e) => warn!("Bad tunnel message: {}", e),
+            Ok(Message::Binary(bytes)) => match Frame::decode(&bytes) {
+                Ok(frame) => {
+                    handle_frame(frame, out_tx.clone(), upstream.clone(), Arc::clone(&conn_map))
+                        .await;
                 }
-            }
+                Err(e) => warn!("Bad frame from server: {}", e),
+            },
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(e) => {
@@ -150,354 +111,153 @@ async fn run_client(
         }
     }
 
+    // Tear down all connections.
+    conn_map.lock().await.clear();
     writer_task.abort();
 }
 
-struct WsFrame {
-    data: String,
-    is_binary: bool,
-    close: bool,
-}
+// ── Frame dispatch ────────────────────────────────────────────────────────────
 
-async fn handle_tunnel_message(
-    msg: TunnelMessage,
-    out_tx: TunnelTx,
+async fn handle_frame(
+    frame: Frame,
+    out_tx: mpsc::Sender<Vec<u8>>,
     upstream: String,
-    http_client: reqwest::Client,
-    ws_sessions: Arc<Mutex<HashMap<String, mpsc::Sender<WsFrame>>>>,
+    conn_map: ConnMap,
 ) {
-    match msg {
-        TunnelMessage::HttpRequest {
-            id,
-            method,
-            path,
-            headers,
-            body,
-        } => {
-            handle_http_request(id, method, path, headers, body, out_tx, upstream, http_client)
-                .await;
+    match frame.frame_type {
+        FRAME_OPEN => {
+            let conn_id = frame.conn_id;
+
+            // Register as "Connecting" immediately so DATA frames arriving before the TCP
+            // handshake completes are buffered rather than dropped.
+            conn_map
+                .lock()
+                .await
+                .insert(conn_id, ConnEntry::Connecting(Vec::new()));
+
+            let out_tx_clone = out_tx.clone();
+            let conn_map_clone = Arc::clone(&conn_map);
+
+            tokio::spawn(async move {
+                match TcpStream::connect(&upstream).await {
+                    Ok(stream) => {
+                        info!("Opened upstream connection for conn {}", conn_id);
+
+                        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+
+                        // Flush buffered data and transition state.
+                        let buffered = {
+                            let mut map = conn_map_clone.lock().await;
+                            match map.get_mut(&conn_id) {
+                                Some(ConnEntry::Connecting(buf)) => {
+                                    let drained = std::mem::take(buf);
+                                    *map.get_mut(&conn_id).unwrap() =
+                                        ConnEntry::Connected(data_tx.clone());
+                                    drained
+                                }
+                                _ => {
+                                    // Entry was removed while we were connecting — abort.
+                                    return;
+                                }
+                            }
+                        };
+
+                        // Forward any data that arrived during connection setup.
+                        for chunk in buffered {
+                            let _ = data_tx.send(chunk).await;
+                        }
+
+                        proxy_conn(conn_id, stream, data_rx, out_tx_clone, conn_map_clone)
+                            .await;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to connect to upstream {} for conn {}: {}",
+                            upstream, conn_id, e
+                        );
+                        conn_map_clone.lock().await.remove(&conn_id);
+                        // Notify server that this connection failed.
+                        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
+                    }
+                }
+            });
         }
 
-        TunnelMessage::WsOpen { id, path, headers } => {
-            handle_ws_open(id, path, headers, out_tx, upstream, ws_sessions).await;
-        }
-
-        TunnelMessage::WsData {
-            id,
-            data,
-            is_binary,
-        } => {
-            let sessions = ws_sessions.lock().await;
-            if let Some(tx) = sessions.get(&id) {
-                let _ = tx
-                    .send(WsFrame {
-                        data,
-                        is_binary,
-                        close: false,
-                    })
-                    .await;
-            }
-        }
-
-        TunnelMessage::WsClose { id } => {
-            let mut sessions = ws_sessions.lock().await;
-            if let Some(tx) = sessions.remove(&id) {
-                let _ = tx
-                    .send(WsFrame {
-                        data: String::new(),
-                        is_binary: false,
-                        close: true,
-                    })
-                    .await;
-            }
-        }
-
-        _ => {}
-    }
-}
-
-async fn handle_http_request(
-    id: String,
-    method: String,
-    path: String,
-    req_headers: Headers,
-    body: Option<String>,
-    out_tx: TunnelTx,
-    upstream: String,
-    http_client: reqwest::Client,
-) {
-    let url = format!("{}{}", upstream, path);
-
-    let method_parsed = match reqwest::Method::from_bytes(method.as_bytes()) {
-        Ok(m) => m,
-        Err(_) => {
-            send_error(&id, 400, "Invalid method", &out_tx).await;
-            return;
-        }
-    };
-
-    let mut request_builder = http_client.request(method_parsed, &url);
-
-    for (name, values) in &req_headers {
-        if HOP_BY_HOP_HEADERS.contains(&name.as_str()) {
-            continue;
-        }
-        if let Ok(header_name) = HeaderName::from_str(name) {
-            for value in values {
-                if let Ok(header_value) = HeaderValue::from_str(value) {
-                    request_builder = request_builder.header(header_name.clone(), header_value);
+        FRAME_DATA => {
+            let mut map = conn_map.lock().await;
+            match map.get_mut(&frame.conn_id) {
+                Some(ConnEntry::Connected(tx)) => {
+                    let _ = tx.send(frame.payload).await;
+                }
+                Some(ConnEntry::Connecting(buf)) => {
+                    buf.push(frame.payload);
+                }
+                None => {
+                    warn!("DATA for unknown conn_id {}", frame.conn_id);
                 }
             }
         }
-    }
 
-    if let Some(b) = body {
-        match decode_base64(&b) {
-            Ok(bytes) => {
-                request_builder = request_builder.body(bytes);
-            }
-            Err(e) => {
-                warn!("Failed to decode request body: {}", e);
-            }
+        FRAME_CLOSE => {
+            conn_map.lock().await.remove(&frame.conn_id);
+        }
+
+        other => {
+            warn!("Unexpected frame type {:#04x} from server", other);
         }
     }
+}
 
-    let response = match request_builder.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Upstream request failed for {}: {}", url, e);
-            send_error(&id, 502, "Upstream request failed", &out_tx).await;
-            return;
-        }
-    };
+// ── Per-connection TCP proxy ──────────────────────────────────────────────────
 
-    let status = response.status().as_u16();
-    let mut resp_headers: Headers = HashMap::new();
-    for (name, value) in response.headers() {
-        if let Ok(v) = value.to_str() {
-            resp_headers
-                .entry(name.as_str().to_lowercase())
-                .or_default()
-                .push(v.to_string());
-        }
-    }
+/// Relay data between the upstream TCP connection and the tunnel.
+async fn proxy_conn(
+    conn_id: u32,
+    stream: TcpStream,
+    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
+    conn_map: ConnMap,
+) {
+    let (mut tcp_rx, mut tcp_tx) = stream.into_split();
+    let out_tx_clone = out_tx.clone();
 
-    let is_streaming = resp_headers
-        .get("content-type")
-        .and_then(|v| v.first())
-        .map(|ct| ct.contains("text/event-stream"))
-        .unwrap_or(false);
-
-    if is_streaming {
-        // Send header chunk first.
-        let _ = out_tx
-            .send(TunnelMessage::HttpResponseChunk {
-                id: id.clone(),
-                status,
-                headers: resp_headers,
-            })
-            .await;
-
-        // Stream body chunks.
-        let mut stream = response.bytes_stream();
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    let _ = out_tx
-                        .send(TunnelMessage::HttpResponseBodyChunk {
-                            id: id.clone(),
-                            data: encode_base64(&chunk),
-                            done: false,
-                        })
-                        .await;
+    // Task: upstream → tunnel (forward received bytes as DATA frames).
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match tcp_rx.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
+                    if out_tx_clone.send(frame).await.is_err() {
+                        break;
+                    }
                 }
                 Err(e) => {
-                    error!("Streaming error for {}: {}", url, e);
+                    error!("Read from upstream error for conn {}: {}", conn_id, e);
                     break;
                 }
             }
         }
-
-        // Signal end of stream.
-        let _ = out_tx
-            .send(TunnelMessage::HttpResponseBodyChunk {
-                id: id.clone(),
-                data: String::new(),
-                done: true,
-            })
-            .await;
-    } else {
-        // Read full body.
-        let body_bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                error!("Failed to read upstream response body: {}", e);
-                send_error(&id, 502, "Failed to read upstream response", &out_tx).await;
-                return;
-            }
-        };
-
-        let body = if body_bytes.is_empty() {
-            None
-        } else {
-            Some(encode_base64(&body_bytes))
-        };
-
-        let _ = out_tx
-            .send(TunnelMessage::HttpResponse {
-                id,
-                status,
-                headers: resp_headers,
-                body,
-            })
-            .await;
-    }
-}
-
-async fn handle_ws_open(
-    id: String,
-    path: String,
-    req_headers: Headers,
-    out_tx: TunnelTx,
-    upstream: String,
-    ws_sessions: Arc<Mutex<HashMap<String, mpsc::Sender<WsFrame>>>>,
-) {
-    // Build the upstream WebSocket URL.
-    let upstream_ws_url = {
-        let base = upstream.replace("http://", "ws://").replace("https://", "wss://");
-        format!("{}{}", base, path)
-    };
-
-    let upstream_url = match Url::parse(&upstream_ws_url) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid upstream WS URL {}: {}", upstream_ws_url, e);
-            let _ = out_tx
-                .send(TunnelMessage::WsClose { id })
-                .await;
-            return;
-        }
-    };
-
-    // Build the WebSocket request with headers.
-    let mut ws_request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
-        .uri(upstream_url.as_str());
-    for (name, values) in &req_headers {
-        if WS_HANDSHAKE_HEADERS.contains(&name.as_str()) {
-            continue;
-        }
-        for value in values {
-            ws_request = ws_request.header(name.as_str(), value.as_str());
-        }
-    }
-    let ws_request = match ws_request.body(()) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to build WS request: {}", e);
-            let _ = out_tx.send(TunnelMessage::WsClose { id }).await;
-            return;
-        }
-    };
-
-    let upstream_ws = match connect_async(ws_request).await {
-        Ok((ws, _)) => ws,
-        Err(e) => {
-            error!("Failed to connect upstream WS {}: {}", upstream_ws_url, e);
-            let _ = out_tx.send(TunnelMessage::WsClose { id }).await;
-            return;
-        }
-    };
-
-    info!("Upstream WebSocket opened: {}", upstream_ws_url);
-
-    let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
-    let (frame_tx, mut frame_rx) = mpsc::channel::<WsFrame>(64);
-
-    ws_sessions.lock().await.insert(id.clone(), frame_tx);
-
-    let id_for_reader = id.clone();
-    let out_tx_for_reader = out_tx.clone();
-
-    // Task: upstream → server (forward upstream WS messages to tunnel).
-    let upstream_to_server = tokio::spawn(async move {
-        while let Some(msg_result) = upstream_rx.next().await {
-            match msg_result {
-                Ok(Message::Text(text)) => {
-                    let _ = out_tx_for_reader
-                        .send(TunnelMessage::WsData {
-                            id: id_for_reader.clone(),
-                            data: encode_base64(text.as_bytes()),
-                            is_binary: false,
-                        })
-                        .await;
-                }
-                Ok(Message::Binary(bin)) => {
-                    let _ = out_tx_for_reader
-                        .send(TunnelMessage::WsData {
-                            id: id_for_reader.clone(),
-                            data: encode_base64(&bin),
-                            is_binary: true,
-                        })
-                        .await;
-                }
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
-        let _ = out_tx_for_reader
-            .send(TunnelMessage::WsClose {
-                id: id_for_reader,
-            })
-            .await;
+        // Notify server that upstream closed.
+        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
     });
 
-    // Task: server → upstream (forward tunnel WsData frames to upstream WS).
-    let server_to_upstream = tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if frame.close {
-                break;
-            }
-            let ws_msg = if frame.is_binary {
-                match decode_base64(&frame.data) {
-                    Ok(bytes) => Message::Binary(bytes.into()),
-                    Err(_) => continue,
-                }
-            } else {
-                match decode_base64(&frame.data) {
-                    Ok(bytes) => Message::Text(
-                        String::from_utf8_lossy(&bytes).to_string().into(),
-                    ),
-                    Err(_) => continue,
-                }
-            };
-            if upstream_tx.send(ws_msg).await.is_err() {
+    // Task: tunnel → upstream (write DATA frames to the upstream TCP socket).
+    let writer = tokio::spawn(async move {
+        while let Some(data) = data_rx.recv().await {
+            if tcp_tx.write_all(&data).await.is_err() {
                 break;
             }
         }
-        let _ = upstream_tx.close().await;
+        let _ = tcp_tx.shutdown().await;
     });
 
-    // Wait for either task to finish, then clean up.
     tokio::select! {
-        _ = upstream_to_server => {}
-        _ = server_to_upstream => {}
+        _ = reader => {}
+        _ = writer => {}
     }
 
-    ws_sessions.lock().await.remove(&id);
-    info!("WebSocket session {} closed", id);
-}
-
-async fn send_error(id: &str, status: u16, message: &str, out_tx: &TunnelTx) {
-    let body = encode_base64(message.as_bytes());
-    let _ = out_tx
-        .send(TunnelMessage::HttpResponse {
-            id: id.to_string(),
-            status,
-            headers: HashMap::from([(
-                "content-type".to_string(),
-                vec!["text/plain".to_string()],
-            )]),
-            body: Some(body),
-        })
-        .await;
+    conn_map.lock().await.remove(&conn_id);
+    info!("Upstream connection for conn {} closed", conn_id);
 }
