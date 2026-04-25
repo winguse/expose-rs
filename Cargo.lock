@@ -241,6 +241,15 @@ name = "expose-common"
 version = "0.1.0"
 
 [[package]]
+name = "expose-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "expose-client",
+ "expose-server",
+ "tokio",
+]
+
+[[package]]
 name = "expose-server"
 version = "0.1.0"
 dependencies = [

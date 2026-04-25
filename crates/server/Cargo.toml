@@ -3,6 +3,10 @@ name = "expose-server"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "expose_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "expose-server"
 path = "src/main.rs"

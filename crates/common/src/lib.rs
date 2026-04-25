@@ -30,15 +30,27 @@ pub struct Frame {
 
 impl Frame {
     pub fn open(conn_id: u32) -> Self {
-        Frame { conn_id, frame_type: FRAME_OPEN, payload: Vec::new() }
+        Frame {
+            conn_id,
+            frame_type: FRAME_OPEN,
+            payload: Vec::new(),
+        }
     }
 
     pub fn data(conn_id: u32, payload: Vec<u8>) -> Self {
-        Frame { conn_id, frame_type: FRAME_DATA, payload }
+        Frame {
+            conn_id,
+            frame_type: FRAME_DATA,
+            payload,
+        }
     }
 
     pub fn close(conn_id: u32) -> Self {
-        Frame { conn_id, frame_type: FRAME_CLOSE, payload: Vec::new() }
+        Frame {
+            conn_id,
+            frame_type: FRAME_CLOSE,
+            payload: Vec::new(),
+        }
     }
 
     /// Encode the frame into a byte buffer suitable for sending as a binary WebSocket message.
@@ -61,8 +73,7 @@ impl Frame {
         }
         let conn_id = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let frame_type = bytes[4];
-        let payload_len =
-            u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
+        let payload_len = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
         if bytes.len() < FRAME_HEADER_LEN + payload_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -70,7 +81,11 @@ impl Frame {
             ));
         }
         let payload = bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len].to_vec();
-        Ok(Frame { conn_id, frame_type, payload })
+        Ok(Frame {
+            conn_id,
+            frame_type,
+            payload,
+        })
     }
 }
 
