@@ -26,26 +26,31 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             use_cross: false
+            rust_targets: x86_64-unknown-linux-gnu
 
           # Linux aarch64 with glibc — cross via Docker
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             use_cross: true
+            rust_targets: ""
 
           # Linux aarch64 with musl (fully static) — cross via Docker
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             use_cross: true
+            rust_targets: ""
 
           # Linux MIPS LE with musl (OpenWrt / embedded) — cross via Docker
           - target: mipsel-unknown-linux-musl
             runner: ubuntu-latest
             use_cross: true
+            rust_targets: ""
 
           # macOS Apple Silicon — native arm64 runner
           - target: aarch64-apple-darwin
             runner: macos-latest
             use_cross: false
+            rust_targets: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +58,7 @@ jobs:
       - name: Install stable Rust toolchain + target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets }}
 
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@v2
