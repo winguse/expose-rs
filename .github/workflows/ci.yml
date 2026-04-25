@@ -4,8 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  release:
-    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,34 +58,3 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
-
-  # ── Release build ────────────────────────────────────────────────────────────
-  build-release:
-    name: Build release binaries
-    runs-on: ubuntu-latest
-    # Only run on an actual published release, not on every PR.
-    if: github.event_name == 'release'
-    needs: [test, clippy, fmt]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install stable Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binaries
-        run: cargo build --release --workspace
-
-      - name: Upload expose-server binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: expose-server
-          path: target/release/expose-server
-
-      - name: Upload expose-client binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: expose-client
-          path: target/release/expose-client
