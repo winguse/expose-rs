@@ -1,4 +1,8 @@
-use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA};
+use expose_common::{
+    acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, ACK_BATCH_SIZE, FRAME_ACK,
+    FRAME_CLOSE, FRAME_DATA,
+};
+pub use expose_common::{CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -15,20 +19,32 @@ use tokio::{
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-// ── App state ─────────────────────────────────────────────────────────────────
-
 struct AppState {
-    tunnel_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    conn_map: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
+    tunnel_tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    conn_map: Mutex<HashMap<u32, ConnEntry>>,
     next_id: AtomicU32,
+    config: CapacityConfig,
+}
+
+struct ConnEntry {
+    tx: mpsc::UnboundedSender<ProxyMsg>,
+    remote_closed: bool,
+    /// Visitor → tunnel: credits until the client ACKs after writing to upstream.
+    inflight_to_tunnel: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+enum ProxyMsg {
+    Data(Vec<u8>),
+    Close,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(config: CapacityConfig) -> Self {
         AppState {
             tunnel_tx: Mutex::new(None),
             conn_map: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
+            config,
         }
     }
 
@@ -37,17 +53,20 @@ impl AppState {
     }
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
 /// Run the expose-rs server on an already-bound listener.
-///
-/// Accepts connections forever (or until the task is cancelled/aborted).
-/// The tunnel client must connect to `ws://<addr>/<secret_token>`.
 pub async fn run_server(listener: TcpListener, secret_token: String) {
+    run_server_with_channel_config(listener, secret_token, CapacityConfig::default()).await;
+}
+
+pub async fn run_server_with_channel_config(
+    listener: TcpListener,
+    secret_token: String,
+    config: CapacityConfig,
+) {
     let addr = listener
         .local_addr()
         .unwrap_or_else(|_| "?".parse().unwrap());
-    let state = Arc::new(AppState::new());
+    let state = Arc::new(AppState::new(config));
     let tunnel_prefix = format!("GET /{} ", secret_token);
 
     info!("expose-server listening on {}", addr);
@@ -66,8 +85,6 @@ pub async fn run_server(listener: TcpListener, secret_token: String) {
         }
     }
 }
-
-// ── Dispatch: tunnel vs proxy ─────────────────────────────────────────────────
 
 async fn handle_connection(stream: TcpStream, state: Arc<AppState>, tunnel_prefix: &str) {
     let mut buf = [0u8; 512];
@@ -90,8 +107,6 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>, tunnel_prefi
     }
 }
 
-// ── Tunnel handler ────────────────────────────────────────────────────────────
-
 async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     info!("Tunnel client connecting via WebSocket handshake");
 
@@ -106,7 +121,7 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     info!("Tunnel client connected");
 
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     {
         let mut guard = state.tunnel_tx.lock().await;
@@ -152,23 +167,55 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
 async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
     match frame.frame_type {
         FRAME_DATA => {
-            let map = state.conn_map.lock().await;
-            if let Some(tx) = map.get(&frame.conn_id) {
-                let _ = tx.send(frame.payload).await;
+            let tx = {
+                let mut map = state.conn_map.lock().await;
+                match map.get_mut(&frame.conn_id) {
+                    Some(entry) if !entry.remote_closed => Some(entry.tx.clone()),
+                    _ => None,
+                }
+            };
+
+            if let Some(tx) = tx {
+                let _ = tx.send(ProxyMsg::Data(frame.payload));
             } else {
                 warn!("DATA for unknown conn_id {}", frame.conn_id);
             }
         }
+        FRAME_ACK => {
+            let ack_count = match frame.ack_count() {
+                Ok(count) => count,
+                Err(e) => {
+                    warn!("Bad ACK frame for conn {}: {}", frame.conn_id, e);
+                    return;
+                }
+            };
+            let sem = {
+                let map = state.conn_map.lock().await;
+                map.get(&frame.conn_id)
+                    .and_then(|e| e.inflight_to_tunnel.clone())
+            };
+            apply_flow_ack(sem.as_deref(), ack_count);
+        }
         FRAME_CLOSE => {
-            state.conn_map.lock().await.remove(&frame.conn_id);
+            let tx = {
+                let mut map = state.conn_map.lock().await;
+                match map.get_mut(&frame.conn_id) {
+                    Some(entry) if !entry.remote_closed => {
+                        entry.remote_closed = true;
+                        Some(entry.tx.clone())
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(ProxyMsg::Close);
+            }
         }
         other => {
             warn!("Unexpected frame type {:#04x} from tunnel", other);
         }
     }
 }
-
-// ── Proxy handler ─────────────────────────────────────────────────────────────
 
 async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let tunnel_tx = {
@@ -183,11 +230,18 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     };
 
     let conn_id = state.next_conn_id();
+    let inflight_to_tunnel = semaphore_for_limit(state.config.max_pending_messages_per_connection);
+    let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
+    state.conn_map.lock().await.insert(
+        conn_id,
+        ConnEntry {
+            tx: data_tx,
+            remote_closed: false,
+            inflight_to_tunnel: inflight_to_tunnel.clone(),
+        },
+    );
 
-    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
-    state.conn_map.lock().await.insert(conn_id, data_tx);
-
-    if tunnel_tx.send(Frame::open(conn_id).encode()).await.is_err() {
+    if tunnel_tx.send(Frame::open(conn_id).encode()).is_err() {
         state.conn_map.lock().await.remove(&conn_id);
         return;
     }
@@ -200,37 +254,56 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
+            let permit = acquire_permit(&inflight_to_tunnel).await;
             match tcp_rx.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    drop(permit);
+                    break;
+                }
                 Ok(n) => {
+                    if let Some(p) = permit {
+                        p.forget();
+                    }
                     let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
-                    if tunnel_tx_clone.send(frame).await.is_err() {
+                    if tunnel_tx_clone.send(frame).is_err() {
                         break;
                     }
                 }
                 Err(e) => {
+                    drop(permit);
                     error!("TCP read error for conn {}: {}", conn_id, e);
                     break;
                 }
             }
         }
-        let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode()).await;
+        let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode());
     });
 
     let writer = tokio::spawn(async move {
         let mut rx = data_rx;
-        while let Some(data) = rx.recv().await {
-            if tcp_tx.write_all(&data).await.is_err() {
-                break;
+        let mut ack_batch: u32 = 0;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ProxyMsg::Data(payload) => {
+                    if tcp_tx.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                    ack_batch = ack_batch.saturating_add(1);
+                    if ack_batch >= ACK_BATCH_SIZE {
+                        let _ = tunnel_tx.send(Frame::ack(conn_id, ack_batch).encode());
+                        ack_batch = 0;
+                    }
+                }
+                ProxyMsg::Close => break,
             }
+        }
+        if ack_batch > 0 {
+            let _ = tunnel_tx.send(Frame::ack(conn_id, ack_batch).encode());
         }
         let _ = tcp_tx.shutdown().await;
     });
 
-    tokio::select! {
-        _ = reader => {}
-        _ = writer => {}
-    }
+    let _ = tokio::join!(reader, writer);
 
     state.conn_map.lock().await.remove(&conn_id);
     info!("Proxied connection {} closed", conn_id);

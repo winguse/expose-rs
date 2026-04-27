@@ -1,5 +1,8 @@
 use clap::Parser;
-use expose_client::run_client_once;
+use expose_client::{
+    run_client_once_with_channel_config, CapacityConfig,
+    DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
+};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -16,6 +19,9 @@ struct Args {
 
     #[arg(long)]
     upstream: String,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION)]
+    max_pending_messages_per_connection: usize,
 }
 
 #[tokio::main]
@@ -32,7 +38,14 @@ async fn main() {
 
     loop {
         info!("Connecting to server: {}", args.server);
-        run_client_once(args.server.clone(), args.upstream.clone()).await;
+        run_client_once_with_channel_config(
+            args.server.clone(),
+            args.upstream.clone(),
+            CapacityConfig {
+                max_pending_messages_per_connection: args.max_pending_messages_per_connection,
+            },
+        )
+        .await;
         warn!("Disconnected from server, reconnecting...");
         sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));

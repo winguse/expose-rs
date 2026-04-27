@@ -9,6 +9,7 @@ Options:
   --host <HOST>               Listen host [default: 0.0.0.0]
   --port <PORT>               Listen port [default: 8080]
   --secret-token <TOKEN>      Secret token path segment [required]
+  --max-pending-messages-per-connection <N>      Max DATA frames proxied TCP→tunnel per connection until client ACK (written to upstream TCP) [default: 256]
 ```
 
 ## Behavior
@@ -34,6 +35,15 @@ For every non-tunnel TCP connection:
    - **Reader**: read from the TCP socket, send `DATA` frames through the tunnel.
    - **Writer**: receive `DATA` frames from the tunnel, write to the TCP socket.
 4. When either side closes, send a `CLOSE` frame and clean up the connection entry.
+
+## Per-Connection Backpressure
+
+Only one hop per direction applies the window:
+
+- **Visitor → tunnel → client → upstream**: The **server** limits how many `DATA` frames it reads from the proxied TCP and sends on the tunnel until the client sends `ACK` after writing to upstream TCP.
+- **Upstream → client → tunnel → visitor**: The **client** limits how many `DATA` frames it reads from upstream and sends until the server sends `ACK` after writing to the visitor TCP.
+
+Each `DATA` consumes one credit (`acquire` + `forget`); the peer returns exactly that many credits with `ACK(conn_id, count)` after successfully writing to its local TCP. The client and server each keep a pending window and `ACK_BATCH_SIZE` (64) as in `expose_common`.
 
 ## Error Handling
 

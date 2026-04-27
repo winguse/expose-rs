@@ -21,7 +21,7 @@ Total header size: **9 bytes**.
 | `conn_id`     | 4 B    | Unique connection identifier (assigned by server, wraps around) |
 | `type`        | 1 B    | Frame type (see below)                         |
 | `payload_len` | 4 B    | Length of the payload in bytes                 |
-| `payload`     | N B    | Raw bytes (empty for OPEN and CLOSE)           |
+| `payload`     | N B    | Raw bytes (empty for OPEN/CLOSE, 4 bytes for ACK) |
 
 ## Frame Types
 
@@ -30,6 +30,17 @@ Total header size: **9 bytes**.
 | `0x01` | `OPEN`  | Server → Client    | A new TCP connection has been accepted by the server. |
 | `0x02` | `DATA`  | Bidirectional      | Raw TCP bytes for the identified connection.          |
 | `0x03` | `CLOSE` | Bidirectional      | The TCP connection has been (or should be) closed.   |
+| `0x04` | `ACK`   | Bidirectional      | Acknowledge that `DATA` frames were written to TCP.  |
+
+### ACK payload
+
+ACK payload is a 4-byte big-endian unsigned integer (`u32`) representing the
+number of DATA messages that were successfully written to the local TCP stream
+for `conn_id` since the previous ACK.
+
+The sender of DATA decrements its per-connection in-flight counter only when it
+receives ACK from the peer, which enables per-connection back pressure without
+coupling unrelated streams.
 
 ## Flow
 
