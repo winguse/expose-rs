@@ -1,7 +1,8 @@
 use clap::Parser;
 use expose_client::{
     run_client_once_with_channel_config, CapacityConfig,
-    DEFAULT_MAX_IN_FLIGHT_FRAMES_PER_CONNECTION,
+    DEFAULT_MAX_PENDING_DOWNSTREAM_MESSAGES_PER_CONNECTION,
+    DEFAULT_MAX_PENDING_UPSTREAM_MESSAGES_PER_CONNECTION,
 };
 use std::time::Duration;
 use tokio::time::sleep;
@@ -20,8 +21,11 @@ struct Args {
     #[arg(long)]
     upstream: String,
 
-    #[arg(long, default_value_t = DEFAULT_MAX_IN_FLIGHT_FRAMES_PER_CONNECTION)]
-    max_in_flight_frames_per_connection: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_PENDING_UPSTREAM_MESSAGES_PER_CONNECTION)]
+    max_pending_upstream_messages_per_connection: usize,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_PENDING_DOWNSTREAM_MESSAGES_PER_CONNECTION)]
+    max_pending_downstream_messages_per_connection: usize,
 }
 
 #[tokio::main]
@@ -42,7 +46,10 @@ async fn main() {
             args.server.clone(),
             args.upstream.clone(),
             CapacityConfig {
-                max_in_flight_frames_per_connection: args.max_in_flight_frames_per_connection,
+                max_pending_upstream_messages_per_connection: args
+                    .max_pending_upstream_messages_per_connection,
+                max_pending_downstream_messages_per_connection: args
+                    .max_pending_downstream_messages_per_connection,
             },
         )
         .await;

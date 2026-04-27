@@ -3,24 +3,20 @@ use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Mutex},
-    time::{sleep, Duration},
+    sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-// ── App state ─────────────────────────────────────────────────────────────────
-
 pub const DEFAULT_MAX_INFLIGHT_TO_TUNNEL_PER_CONNECTION: usize = 256;
 pub const DEFAULT_MAX_INFLIGHT_FROM_TUNNEL_PER_CONNECTION: usize = 256;
-const INFLIGHT_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct CapacityConfig {
@@ -48,11 +44,14 @@ struct AppState {
 struct ConnEntry {
     tx: mpsc::UnboundedSender<ProxyMsg>,
     remote_closed: bool,
-    queued_from_tunnel: Arc<AtomicUsize>,
+    inflight_from_tunnel: Option<Arc<Semaphore>>,
 }
 
 enum ProxyMsg {
-    Data(Vec<u8>),
+    Data {
+        payload: Vec<u8>,
+        permit: Option<OwnedSemaphorePermit>,
+    },
     Close,
 }
 
@@ -60,31 +59,22 @@ enum TunnelMsg {
     Frame(Vec<u8>),
     Data {
         bytes: Vec<u8>,
-        inflight_counter: Arc<AtomicUsize>,
+        permit: Option<OwnedSemaphorePermit>,
     },
 }
 
-fn decrement_counter(counter: &AtomicUsize) {
-    let mut current = counter.load(Ordering::Acquire);
-    while current > 0 {
-        match counter.compare_exchange_weak(
-            current,
-            current - 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return,
-            Err(next) => current = next,
-        }
+fn semaphore_for_limit(limit: usize) -> Option<Arc<Semaphore>> {
+    if limit == 0 {
+        None
+    } else {
+        Some(Arc::new(Semaphore::new(limit)))
     }
 }
 
-async fn wait_for_slot(counter: &AtomicUsize, max_inflight: usize) {
-    if max_inflight == 0 {
-        return;
-    }
-    while counter.load(Ordering::Acquire) >= max_inflight {
-        sleep(INFLIGHT_WAIT_POLL_INTERVAL).await;
+async fn acquire_permit(limit: &Option<Arc<Semaphore>>) -> Option<OwnedSemaphorePermit> {
+    match limit {
+        Some(sem) => sem.clone().acquire_owned().await.ok(),
+        None => None,
     }
 }
 
@@ -103,17 +93,11 @@ impl AppState {
     }
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
 /// Run the expose-rs server on an already-bound listener.
-///
-/// Accepts connections forever (or until the task is cancelled/aborted).
-/// The tunnel client must connect to `ws://<addr>/<secret_token>`.
 pub async fn run_server(listener: TcpListener, secret_token: String) {
     run_server_with_channel_config(listener, secret_token, CapacityConfig::default()).await;
 }
 
-/// Same as [`run_server`], but allows tuning per-connection in-flight limits.
 pub async fn run_server_with_channel_config(
     listener: TcpListener,
     secret_token: String,
@@ -142,8 +126,6 @@ pub async fn run_server_with_channel_config(
     }
 }
 
-// ── Dispatch: tunnel vs proxy ─────────────────────────────────────────────────
-
 async fn handle_connection(stream: TcpStream, state: Arc<AppState>, tunnel_prefix: &str) {
     let mut buf = [0u8; 512];
     let n = match stream.peek(&mut buf).await {
@@ -164,8 +146,6 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>, tunnel_prefi
         handle_proxy(stream, state).await;
     }
 }
-
-// ── Tunnel handler ────────────────────────────────────────────────────────────
 
 async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     info!("Tunnel client connecting via WebSocket handshake");
@@ -191,23 +171,19 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = tunnel_rx.recv().await {
-            let (bytes, inflight_counter) = match msg {
-                TunnelMsg::Frame(bytes) => (bytes, None),
-                TunnelMsg::Data {
-                    bytes,
-                    inflight_counter,
-                } => (bytes, Some(inflight_counter)),
-            };
-
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
-                if let Some(counter) = inflight_counter {
-                    decrement_counter(&counter);
+            match msg {
+                TunnelMsg::Frame(bytes) => {
+                    if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                        break;
+                    }
                 }
-                break;
-            }
-
-            if let Some(counter) = inflight_counter {
-                decrement_counter(&counter);
+                TunnelMsg::Data { bytes, permit } => {
+                    let send_result = ws_tx.send(Message::Binary(bytes)).await;
+                    drop(permit);
+                    if send_result.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = ws_tx.close().await;
@@ -242,56 +218,26 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
 async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
     match frame.frame_type {
         FRAME_DATA => {
-            let limit = state.config.max_inflight_from_tunnel_per_connection;
-            let decision = {
+            let conn = {
                 let mut map = state.conn_map.lock().await;
                 match map.get_mut(&frame.conn_id) {
-                    Some(entry) if entry.remote_closed => DispatchDataDecision::Drop,
-                    Some(entry)
-                        if limit > 0
-                            && entry.queued_from_tunnel.load(Ordering::Acquire) >= limit =>
-                    {
-                        entry.remote_closed = true;
-                        DispatchDataDecision::Overflow {
-                            tx: entry.tx.clone(),
-                        }
+                    Some(entry) if !entry.remote_closed => {
+                        Some((entry.tx.clone(), entry.inflight_from_tunnel.clone()))
                     }
-                    Some(entry) => {
-                        entry.queued_from_tunnel.fetch_add(1, Ordering::AcqRel);
-                        DispatchDataDecision::Forward {
-                            tx: entry.tx.clone(),
-                            queued_from_tunnel: Arc::clone(&entry.queued_from_tunnel),
-                        }
-                    }
-                    None => DispatchDataDecision::Unknown,
+                    _ => None,
                 }
             };
 
-            match decision {
-                DispatchDataDecision::Forward {
-                    tx,
-                    queued_from_tunnel,
-                } => {
-                    if tx.send(ProxyMsg::Data(frame.payload)).is_err() {
-                        decrement_counter(&queued_from_tunnel);
-                    }
-                }
-                DispatchDataDecision::Overflow { tx } => {
-                    warn!(
-                        "conn {} exceeded max in-flight from tunnel limit; closing connection",
-                        frame.conn_id
-                    );
-                    let _ = tx.send(ProxyMsg::Close);
-                    if let Some(tunnel_tx) = state.tunnel_tx.lock().await.as_ref().cloned() {
-                        let _ =
-                            tunnel_tx.send(TunnelMsg::Frame(Frame::close(frame.conn_id).encode()));
-                    }
-                }
-                DispatchDataDecision::Drop => {}
-                DispatchDataDecision::Unknown => {
-                    warn!("DATA for unknown conn_id {}", frame.conn_id);
-                }
-            }
+            let Some((tx, limit)) = conn else {
+                warn!("DATA for unknown conn_id {}", frame.conn_id);
+                return;
+            };
+
+            let permit = acquire_permit(&limit).await;
+            let _ = tx.send(ProxyMsg::Data {
+                payload: frame.payload,
+                permit,
+            });
         }
         FRAME_CLOSE => {
             let tx = {
@@ -314,20 +260,6 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
     }
 }
 
-enum DispatchDataDecision {
-    Forward {
-        tx: mpsc::UnboundedSender<ProxyMsg>,
-        queued_from_tunnel: Arc<AtomicUsize>,
-    },
-    Overflow {
-        tx: mpsc::UnboundedSender<ProxyMsg>,
-    },
-    Drop,
-    Unknown,
-}
-
-// ── Proxy handler ─────────────────────────────────────────────────────────────
-
 async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let tunnel_tx = {
         let guard = state.tunnel_tx.lock().await;
@@ -341,14 +273,15 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     };
 
     let conn_id = state.next_conn_id();
-    let queued_from_tunnel = Arc::new(AtomicUsize::new(0));
+    let inflight_from_tunnel =
+        semaphore_for_limit(state.config.max_inflight_from_tunnel_per_connection);
     let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
     state.conn_map.lock().await.insert(
         conn_id,
         ConnEntry {
             tx: data_tx,
             remote_closed: false,
-            queued_from_tunnel: Arc::clone(&queued_from_tunnel),
+            inflight_from_tunnel,
         },
     );
 
@@ -364,29 +297,29 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
 
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
     let tunnel_tx_clone = tunnel_tx.clone();
-    let to_tunnel_inflight = Arc::new(AtomicUsize::new(0));
-    let to_tunnel_inflight_reader = Arc::clone(&to_tunnel_inflight);
-    let max_to_tunnel = state.config.max_inflight_to_tunnel_per_connection;
+    let inflight_to_tunnel =
+        semaphore_for_limit(state.config.max_inflight_to_tunnel_per_connection);
 
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
-            wait_for_slot(&to_tunnel_inflight_reader, max_to_tunnel).await;
-
+            let permit = acquire_permit(&inflight_to_tunnel).await;
             match tcp_rx.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    drop(permit);
+                    break;
+                }
                 Ok(n) => {
-                    to_tunnel_inflight_reader.fetch_add(1, Ordering::AcqRel);
                     let msg = TunnelMsg::Data {
                         bytes: Frame::data(conn_id, buf[..n].to_vec()).encode(),
-                        inflight_counter: Arc::clone(&to_tunnel_inflight_reader),
+                        permit,
                     };
                     if tunnel_tx_clone.send(msg).is_err() {
-                        decrement_counter(&to_tunnel_inflight_reader);
                         break;
                     }
                 }
                 Err(e) => {
+                    drop(permit);
                     error!("TCP read error for conn {}: {}", conn_id, e);
                     break;
                 }
@@ -395,14 +328,14 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         let _ = tunnel_tx_clone.send(TunnelMsg::Frame(Frame::close(conn_id).encode()));
     });
 
-    let queued_from_tunnel_writer = Arc::clone(&queued_from_tunnel);
     let writer = tokio::spawn(async move {
         let mut rx = data_rx;
         while let Some(msg) = rx.recv().await {
             match msg {
-                ProxyMsg::Data(data) => {
-                    decrement_counter(&queued_from_tunnel_writer);
-                    if tcp_tx.write_all(&data).await.is_err() {
+                ProxyMsg::Data { payload, permit } => {
+                    let write_result = tcp_tx.write_all(&payload).await;
+                    drop(permit);
+                    if write_result.is_err() {
                         break;
                     }
                 }
