@@ -173,11 +173,35 @@ async fn test_large_data() {
     stream.write_all(&payload).await.unwrap();
 
     // Read back exactly as many bytes as we sent (the echo server mirrors the
-    // data). We do NOT close the write-side before reading: sending a TCP FIN
-    // currently causes the tunnel to emit a CLOSE frame which tears down the
-    // full connection before in-flight echo data can return.
+    // data) without closing the write side first.
     let mut received = vec![0u8; payload.len()];
     timeout(Duration::from_secs(15), stream.read_exact(&mut received))
+        .await
+        .expect("read timed out")
+        .expect("read failed");
+
+    assert_eq!(received, payload);
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// Closing the local write-half (TCP FIN) must not discard data still flowing
+/// back from upstream on the read-half.
+#[tokio::test]
+async fn test_half_close_still_receives_response() {
+    let upstream = start_echo_server().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+
+    wait_until_tunnel_ready(server_addr).await;
+
+    let payload = b"half-close-check".to_vec();
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut received = vec![0u8; payload.len()];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut received))
         .await
         .expect("read timed out")
         .expect("read failed");

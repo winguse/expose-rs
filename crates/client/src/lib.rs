@@ -209,10 +209,7 @@ async fn proxy_conn(
         let _ = tcp_tx.shutdown().await;
     });
 
-    tokio::select! {
-        _ = reader => {}
-        _ = writer => {}
-    }
+    let _ = tokio::join!(reader, writer);
 
     conn_map.lock().await.remove(&conn_id);
     info!("Upstream connection for conn {} closed", conn_id);

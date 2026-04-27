@@ -227,10 +227,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         let _ = tcp_tx.shutdown().await;
     });
 
-    tokio::select! {
-        _ = reader => {}
-        _ = writer => {}
-    }
+    let _ = tokio::join!(reader, writer);
 
     state.conn_map.lock().await.remove(&conn_id);
     info!("Proxied connection {} closed", conn_id);
