@@ -30,6 +30,8 @@ When an `OPEN` frame is received for `conn_id`:
 - If connection is `Connecting`: append payload to buffer.
 - If connection is `Connected`: send payload into the upstream writer channel.
 - If connection is unknown: log a warning and discard.
+- After data is successfully written to upstream TCP, send an `ACK` frame back to
+  the server indicating how many `DATA` frames were applied to the socket.
 
 ## CLOSE Frame Handling
 
@@ -39,8 +41,10 @@ Remove the connection entry from the map (the writer task will notice the channe
 
 For each upstream TCP connection:
 
-- **Reader task**: read from upstream TCP, send `DATA` frames to server, send `CLOSE` on EOF/error.
-- **Writer task**: receive `DATA` payloads, write to upstream TCP, shutdown on channel close.
+- **Reader task**: read from upstream TCP, send `DATA` frames to server, send
+  `CLOSE` on EOF/error.
+- **Writer task**: receive `DATA` payloads, write to upstream TCP, emit `ACK`
+  frames after successful writes, shutdown on channel close.
 
 ## Error Handling
 

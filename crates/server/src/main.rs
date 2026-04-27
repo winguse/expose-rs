@@ -1,7 +1,7 @@
 use clap::Parser;
 use expose_server::{
     run_server_with_channel_config, CapacityConfig,
-    DEFAULT_MAX_INFLIGHT_FROM_TUNNEL_PER_CONNECTION, DEFAULT_MAX_INFLIGHT_TO_TUNNEL_PER_CONNECTION,
+    DEFAULT_MAX_UNACKED_TO_TUNNEL_FRAMES_PER_CONNECTION,
 };
 use tokio::net::TcpListener;
 
@@ -21,11 +21,8 @@ struct Args {
     #[arg(long)]
     secret_token: String,
 
-    #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_TO_TUNNEL_PER_CONNECTION)]
-    max_inflight_to_tunnel_per_connection: usize,
-
-    #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_FROM_TUNNEL_PER_CONNECTION)]
-    max_inflight_from_tunnel_per_connection: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_UNACKED_TO_TUNNEL_FRAMES_PER_CONNECTION)]
+    max_unacked_to_tunnel_frames_per_connection: usize,
 }
 
 #[tokio::main]
@@ -44,8 +41,8 @@ async fn main() {
         listener,
         args.secret_token,
         CapacityConfig {
-            max_inflight_to_tunnel_per_connection: args.max_inflight_to_tunnel_per_connection,
-            max_inflight_from_tunnel_per_connection: args.max_inflight_from_tunnel_per_connection,
+            max_unacked_to_tunnel_frames_per_connection: args
+                .max_unacked_to_tunnel_frames_per_connection,
         },
     )
     .await;

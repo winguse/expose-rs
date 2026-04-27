@@ -8,6 +8,8 @@ pub const FRAME_OPEN: u8 = 0x01;
 pub const FRAME_DATA: u8 = 0x02;
 /// Bidirectional: TCP connection closed.  Payload is empty.
 pub const FRAME_CLOSE: u8 = 0x03;
+/// Bidirectional: peer acknowledged written DATA frames. Payload is u32 count.
+pub const FRAME_ACK: u8 = 0x04;
 
 // ── Wire layout ──────────────────────────────────────────────────────────────
 //
@@ -51,6 +53,35 @@ impl Frame {
             frame_type: FRAME_CLOSE,
             payload: Vec::new(),
         }
+    }
+
+    pub fn ack(conn_id: u32, count: u32) -> Self {
+        Frame {
+            conn_id,
+            frame_type: FRAME_ACK,
+            payload: count.to_be_bytes().to_vec(),
+        }
+    }
+
+    pub fn ack_count(&self) -> Result<u32, io::Error> {
+        if self.frame_type != FRAME_ACK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame is not ACK",
+            ));
+        }
+        if self.payload.len() != 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ACK payload must be 4 bytes",
+            ));
+        }
+        Ok(u32::from_be_bytes([
+            self.payload[0],
+            self.payload[1],
+            self.payload[2],
+            self.payload[3],
+        ]))
     }
 
     /// Encode the frame into a byte buffer suitable for sending as a binary WebSocket message.
@@ -122,6 +153,16 @@ mod tests {
         assert_eq!(dec.conn_id, 1);
         assert_eq!(dec.frame_type, FRAME_CLOSE);
         assert!(dec.payload.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_ack() {
+        let f = Frame::ack(9, 3);
+        let enc = f.encode();
+        let dec = Frame::decode(&enc).unwrap();
+        assert_eq!(dec.conn_id, 9);
+        assert_eq!(dec.frame_type, FRAME_ACK);
+        assert_eq!(dec.ack_count().unwrap(), 3);
     }
 
     #[test]

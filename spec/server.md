@@ -9,6 +9,8 @@ Options:
   --host <HOST>               Listen host [default: 0.0.0.0]
   --port <PORT>               Listen port [default: 8080]
   --secret-token <TOKEN>      Secret token path segment [required]
+  --max-inflight-to-tunnel-per-connection <N>    Max unacked DATA frames sent to client per connection [default: 256]
+  --max-inflight-from-tunnel-per-connection <N>  Max unacked DATA frames received from client per connection [default: 256]
 ```
 
 ## Behavior
@@ -34,6 +36,13 @@ For every non-tunnel TCP connection:
    - **Reader**: read from the TCP socket, send `DATA` frames through the tunnel.
    - **Writer**: receive `DATA` frames from the tunnel, write to the TCP socket.
 4. When either side closes, send a `CLOSE` frame and clean up the connection entry.
+
+## Per-Connection Backpressure
+
+- The server enforces per-connection in-flight limits independently in each direction.
+- Sending side consumes one credit per `DATA` frame sent.
+- The credit is returned only when an `ACK(conn_id, count)` frame is received from the peer.
+- `ACK` is emitted by the receiving side after bytes are successfully written into the local TCP stream.
 
 ## Error Handling
 

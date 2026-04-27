@@ -1,4 +1,4 @@
-use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
+use expose_common::{Frame, FRAME_ACK, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
@@ -32,6 +32,7 @@ impl Default for CapacityConfig {
 struct ConnEntry {
     tx: mpsc::UnboundedSender<ProxyMsg>,
     remote_closed: bool,
+    inflight_to_server: Option<Arc<Semaphore>>,
     inflight_from_server: Option<Arc<Semaphore>>,
 }
 
@@ -167,6 +168,8 @@ async fn handle_frame(
     match frame.frame_type {
         FRAME_OPEN => {
             let conn_id = frame.conn_id;
+            let inflight_to_server =
+                semaphore_for_limit(channel_config.max_pending_upstream_messages_per_connection);
             let inflight_from_server =
                 semaphore_for_limit(channel_config.max_pending_downstream_messages_per_connection);
             let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
@@ -175,14 +178,13 @@ async fn handle_frame(
                 ConnEntry {
                     tx: data_tx.clone(),
                     remote_closed: false,
+                    inflight_to_server,
                     inflight_from_server: inflight_from_server.clone(),
                 },
             );
 
             let out_tx_clone = out_tx.clone();
             let conn_map_clone = Arc::clone(&conn_map);
-            let max_pending_upstream = channel_config.max_pending_upstream_messages_per_connection;
-
             tokio::spawn(async move {
                 match TcpStream::connect(&upstream).await {
                     Ok(stream) => {
@@ -191,15 +193,7 @@ async fn handle_frame(
                             return;
                         }
 
-                        proxy_conn(
-                            conn_id,
-                            stream,
-                            data_rx,
-                            out_tx_clone,
-                            conn_map_clone,
-                            max_pending_upstream,
-                        )
-                        .await;
+                        proxy_conn(conn_id, stream, data_rx, out_tx_clone, conn_map_clone).await;
                     }
                     Err(e) => {
                         error!(
@@ -213,6 +207,28 @@ async fn handle_frame(
             });
         }
 
+        FRAME_ACK => {
+            let count = match frame.ack_count() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Bad ACK frame for conn {}: {}", frame.conn_id, e);
+                    return;
+                }
+            };
+            if count == 0 {
+                return;
+            }
+
+            let sem = {
+                let map = conn_map.lock().await;
+                map.get(&frame.conn_id)
+                    .and_then(|entry| entry.inflight_to_server.clone())
+            };
+            if let Some(sem) = sem {
+                sem.add_permits(count as usize);
+            }
+        }
+
         FRAME_DATA => {
             let conn = {
                 let mut map = conn_map.lock().await;
@@ -221,6 +237,7 @@ async fn handle_frame(
                         tx,
                         remote_closed,
                         inflight_from_server,
+                        ..
                     }) => {
                         if *remote_closed {
                             None
@@ -276,16 +293,23 @@ async fn proxy_conn(
     mut data_rx: mpsc::UnboundedReceiver<ProxyMsg>,
     out_tx: mpsc::UnboundedSender<WsOutMsg>,
     conn_map: ConnMap,
-    max_pending_upstream_messages_per_connection: usize,
 ) {
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
     let out_tx_clone = out_tx.clone();
-    let inflight_to_server = semaphore_for_limit(max_pending_upstream_messages_per_connection);
+    let conn_map_for_reader = Arc::clone(&conn_map);
+    let mut write_ack_count: u32 = 0;
 
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
-            let permit = acquire_permit(&inflight_to_server).await;
+            let permit = {
+                let sem = {
+                    let map = conn_map_for_reader.lock().await;
+                    map.get(&conn_id)
+                        .and_then(|entry| entry.inflight_to_server.clone())
+                };
+                acquire_permit(&sem).await
+            };
 
             match tcp_rx.read(&mut buf).await {
                 Ok(0) => {
@@ -320,9 +344,21 @@ async fn proxy_conn(
                     if write_result.is_err() {
                         break;
                     }
+                    write_ack_count = write_ack_count.saturating_add(1);
+                    if write_ack_count >= 64 {
+                        let _ = out_tx.send(WsOutMsg::Frame(
+                            Frame::ack(conn_id, write_ack_count).encode(),
+                        ));
+                        write_ack_count = 0;
+                    }
                 }
                 ProxyMsg::Close => break,
             }
+        }
+        if write_ack_count > 0 {
+            let _ = out_tx.send(WsOutMsg::Frame(
+                Frame::ack(conn_id, write_ack_count).encode(),
+            ));
         }
         let _ = tcp_tx.shutdown().await;
     });
