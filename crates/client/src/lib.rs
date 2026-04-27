@@ -9,22 +9,17 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-pub const DEFAULT_MAX_PENDING_UPSTREAM_MESSAGES_PER_CONNECTION: usize = 256;
-pub const DEFAULT_MAX_PENDING_DOWNSTREAM_MESSAGES_PER_CONNECTION: usize = 256;
+pub const DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CapacityConfig {
-    pub max_pending_upstream_messages_per_connection: usize,
-    pub max_pending_downstream_messages_per_connection: usize,
+    pub max_pending_messages_per_connection: usize,
 }
 
 impl Default for CapacityConfig {
     fn default() -> Self {
         CapacityConfig {
-            max_pending_upstream_messages_per_connection:
-                DEFAULT_MAX_PENDING_UPSTREAM_MESSAGES_PER_CONNECTION,
-            max_pending_downstream_messages_per_connection:
-                DEFAULT_MAX_PENDING_DOWNSTREAM_MESSAGES_PER_CONNECTION,
+            max_pending_messages_per_connection: DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
         }
     }
 }
@@ -33,25 +28,18 @@ struct ConnEntry {
     tx: mpsc::UnboundedSender<ProxyMsg>,
     remote_closed: bool,
     inflight_to_server: Option<Arc<Semaphore>>,
-    inflight_from_server: Option<Arc<Semaphore>>,
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
 
 enum ProxyMsg {
-    Data {
-        payload: Vec<u8>,
-        permit: Option<OwnedSemaphorePermit>,
-    },
+    Data { payload: Vec<u8> },
     Close,
 }
 
 enum WsOutMsg {
     Frame(Vec<u8>),
-    Data {
-        bytes: Vec<u8>,
-        permit: Option<OwnedSemaphorePermit>,
-    },
+    Data(Vec<u8>),
 }
 
 fn semaphore_for_limit(limit: usize) -> Option<Arc<Semaphore>> {
@@ -111,17 +99,14 @@ async fn run_client(
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            let (bytes, permit) = match msg {
-                WsOutMsg::Frame(bytes) => (bytes, None),
-                WsOutMsg::Data { bytes, permit } => (bytes, permit),
+            let bytes = match msg {
+                WsOutMsg::Frame(bytes) => bytes,
+                WsOutMsg::Data(bytes) => bytes,
             };
 
             if ws_tx.send(Message::Binary(bytes)).await.is_err() {
-                drop(permit);
                 break;
             }
-
-            drop(permit);
         }
         let _ = ws_tx.close().await;
     });
@@ -169,9 +154,7 @@ async fn handle_frame(
         FRAME_OPEN => {
             let conn_id = frame.conn_id;
             let inflight_to_server =
-                semaphore_for_limit(channel_config.max_pending_upstream_messages_per_connection);
-            let inflight_from_server =
-                semaphore_for_limit(channel_config.max_pending_downstream_messages_per_connection);
+                semaphore_for_limit(channel_config.max_pending_messages_per_connection);
             let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
             conn_map.lock().await.insert(
                 conn_id,
@@ -179,7 +162,6 @@ async fn handle_frame(
                     tx: data_tx.clone(),
                     remote_closed: false,
                     inflight_to_server,
-                    inflight_from_server: inflight_from_server.clone(),
                 },
             );
 
@@ -219,13 +201,14 @@ async fn handle_frame(
                 return;
             }
 
-            let sem = {
-                let map = conn_map.lock().await;
-                map.get(&frame.conn_id)
-                    .and_then(|entry| entry.inflight_to_server.clone())
-            };
-            if let Some(sem) = sem {
-                sem.add_permits(count as usize);
+            let map = conn_map.lock().await;
+            match map.get(&frame.conn_id) {
+                Some(entry) => entry
+                    .inflight_to_server
+                    .clone()
+                    .unwrap()
+                    .add_permits(count as usize),
+                None => return,
             }
         }
 
@@ -234,15 +217,12 @@ async fn handle_frame(
                 let mut map = conn_map.lock().await;
                 match map.get_mut(&frame.conn_id) {
                     Some(ConnEntry {
-                        tx,
-                        remote_closed,
-                        inflight_from_server,
-                        ..
+                        tx, remote_closed, ..
                     }) => {
                         if *remote_closed {
                             None
                         } else {
-                            Some((tx.clone(), inflight_from_server.clone()))
+                            Some(tx.clone())
                         }
                     }
                     None => {
@@ -251,11 +231,9 @@ async fn handle_frame(
                     }
                 }
             };
-            if let Some((tx, inflight_from_server)) = conn {
-                let permit = acquire_permit(&inflight_from_server).await;
+            if let Some(tx) = conn {
                 let _ = tx.send(ProxyMsg::Data {
                     payload: frame.payload,
-                    permit,
                 });
             }
         }
@@ -302,14 +280,15 @@ async fn proxy_conn(
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
-            let permit = {
-                let sem = {
-                    let map = conn_map_for_reader.lock().await;
-                    map.get(&conn_id)
-                        .and_then(|entry| entry.inflight_to_server.clone())
-                };
-                acquire_permit(&sem).await
+            let sem = {
+                let map = conn_map_for_reader.lock().await;
+                match map.get(&conn_id) {
+                    Some(entry) => entry.inflight_to_server.clone(),
+                    None => break,
+                }
             };
+
+            let permit = acquire_permit(&sem).await;
 
             match tcp_rx.read(&mut buf).await {
                 Ok(0) => {
@@ -317,10 +296,10 @@ async fn proxy_conn(
                     break;
                 }
                 Ok(n) => {
-                    let msg = WsOutMsg::Data {
-                        bytes: Frame::data(conn_id, buf[..n].to_vec()).encode(),
-                        permit,
-                    };
+                    if let Some(p) = permit {
+                        p.forget();
+                    }
+                    let msg = WsOutMsg::Data(Frame::data(conn_id, buf[..n].to_vec()).encode());
                     if out_tx_clone.send(msg).is_err() {
                         break;
                     }
@@ -338,9 +317,8 @@ async fn proxy_conn(
     let writer = tokio::spawn(async move {
         while let Some(msg) = data_rx.recv().await {
             match msg {
-                ProxyMsg::Data { payload, permit } => {
+                ProxyMsg::Data { payload } => {
                     let write_result = tcp_tx.write_all(&payload).await;
-                    drop(permit);
                     if write_result.is_err() {
                         break;
                     }
