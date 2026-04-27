@@ -1,8 +1,8 @@
-pub use expose_common::{CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION};
 use expose_common::{
-    acquire_permit, apply_flow_ack, semaphore_for_limit, ACK_BATCH_SIZE, Frame, FRAME_ACK,
+    acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, ACK_BATCH_SIZE, FRAME_ACK,
     FRAME_CLOSE, FRAME_DATA,
 };
+pub use expose_common::{CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -230,8 +230,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     };
 
     let conn_id = state.next_conn_id();
-    let inflight_to_tunnel =
-        semaphore_for_limit(state.config.max_pending_messages_per_connection);
+    let inflight_to_tunnel = semaphore_for_limit(state.config.max_pending_messages_per_connection);
     let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
     state.conn_map.lock().await.insert(
         conn_id,
