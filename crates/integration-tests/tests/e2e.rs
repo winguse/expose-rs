@@ -53,13 +53,21 @@ async fn start_tunnel(
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
-    let server_task = tokio::spawn(expose_server::run_server(server_listener, secret.clone()));
+    let server_task = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener,
+        secret.clone(),
+        expose_server::CapacityConfig::default(),
+    ));
 
     // Give the server a moment to enter its accept loop.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let ws_url = format!("ws://{}/{}", server_addr, secret);
-    let client_task = tokio::spawn(expose_client::run_client_once(ws_url, upstream.to_string()));
+    let client_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url,
+        upstream.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
 
     (server_addr, server_task, client_task)
 }

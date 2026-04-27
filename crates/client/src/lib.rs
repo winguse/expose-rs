@@ -11,13 +11,31 @@ use tracing::{error, info, warn};
 
 // ── Connection state ──────────────────────────────────────────────────────────
 
+pub const DEFAULT_WS_SEND_CHANNEL_CAPACITY: usize = 1024;
+pub const DEFAULT_CONNECTION_CHANNEL_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+pub struct CapacityConfig {
+    pub ws_send_channel_capacity: usize,
+    pub connection_channel_capacity: usize,
+}
+
+impl Default for CapacityConfig {
+    fn default() -> Self {
+        CapacityConfig {
+            ws_send_channel_capacity: DEFAULT_WS_SEND_CHANNEL_CAPACITY,
+            connection_channel_capacity: DEFAULT_CONNECTION_CHANNEL_CAPACITY,
+        }
+    }
+}
+
 enum ConnEntry {
     Connecting {
         buffered: Vec<Vec<u8>>,
         remote_closed: bool,
     },
     Connected {
-        tx: mpsc::UnboundedSender<ProxyMsg>,
+        tx: mpsc::Sender<ProxyMsg>,
         remote_closed: bool,
     },
 }
@@ -36,10 +54,20 @@ enum ProxyMsg {
 /// Returns when the WebSocket connection to the server is closed (or fails).
 /// Does **not** reconnect; the caller is responsible for retry logic.
 pub async fn run_client_once(server_url: String, upstream: String) {
+    run_client_once_with_channel_config(server_url, upstream, CapacityConfig::default()).await;
+}
+
+/// Connect to the expose-rs server once and relay connections to `upstream`,
+/// using explicit bounded channel capacities.
+pub async fn run_client_once_with_channel_config(
+    server_url: String,
+    upstream: String,
+    channel_config: CapacityConfig,
+) {
     match connect_async(&server_url).await {
         Ok((ws, _)) => {
             info!("Connected to server at {}", server_url);
-            run_client(ws, upstream).await;
+            run_client(ws, upstream, channel_config).await;
         }
         Err(e) => {
             error!("Failed to connect to {}: {}", server_url, e);
@@ -54,9 +82,10 @@ async fn run_client(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     upstream: String,
+    channel_config: CapacityConfig,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(channel_config.ws_send_channel_capacity);
 
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = out_rx.recv().await {
@@ -78,6 +107,7 @@ async fn run_client(
                         out_tx.clone(),
                         upstream.clone(),
                         Arc::clone(&conn_map),
+                        channel_config.connection_channel_capacity,
                     )
                     .await;
                 }
@@ -100,9 +130,10 @@ async fn run_client(
 
 async fn handle_frame(
     frame: Frame,
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
     upstream: String,
     conn_map: ConnMap,
+    conn_channel_capacity: usize,
 ) {
     match frame.frame_type {
         FRAME_OPEN => {
@@ -124,7 +155,7 @@ async fn handle_frame(
                     Ok(stream) => {
                         info!("Opened upstream connection for conn {}", conn_id);
 
-                        let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
+                        let (data_tx, data_rx) = mpsc::channel::<ProxyMsg>(conn_channel_capacity);
 
                         let (buffered, remote_closed) = {
                             let mut map = conn_map_clone.lock().await;
@@ -146,7 +177,7 @@ async fn handle_frame(
                         };
 
                         for chunk in buffered {
-                            let _ = data_tx.send(ProxyMsg::Data(chunk));
+                            let _ = data_tx.send(ProxyMsg::Data(chunk)).await;
                         }
 
                         if remote_closed {
@@ -161,7 +192,7 @@ async fn handle_frame(
                                 }
                             };
                             if let Some(tx) = tx {
-                                let _ = tx.send(ProxyMsg::Close);
+                                let _ = tx.send(ProxyMsg::Close).await;
                             }
                         }
 
@@ -173,7 +204,7 @@ async fn handle_frame(
                             upstream, conn_id, e
                         );
                         conn_map_clone.lock().await.remove(&conn_id);
-                        let _ = out_tx_clone.send(Frame::close(conn_id).encode());
+                        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
                     }
                 }
             });
@@ -202,7 +233,7 @@ async fn handle_frame(
                 }
             };
             if let Some(tx) = tx {
-                let _ = tx.send(ProxyMsg::Data(payload.take().unwrap()));
+                let _ = tx.send(ProxyMsg::Data(payload.take().unwrap())).await;
             }
         }
 
@@ -223,7 +254,7 @@ async fn handle_frame(
                 }
             };
             if let Some(tx) = tx {
-                let _ = tx.send(ProxyMsg::Close);
+                let _ = tx.send(ProxyMsg::Close).await;
             }
         }
 
@@ -238,8 +269,8 @@ async fn handle_frame(
 async fn proxy_conn(
     conn_id: u32,
     stream: TcpStream,
-    mut data_rx: mpsc::UnboundedReceiver<ProxyMsg>,
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    mut data_rx: mpsc::Receiver<ProxyMsg>,
+    out_tx: mpsc::Sender<Vec<u8>>,
     conn_map: ConnMap,
 ) {
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
@@ -252,7 +283,7 @@ async fn proxy_conn(
                 Ok(0) => break,
                 Ok(n) => {
                     let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
-                    if out_tx_clone.send(frame).is_err() {
+                    if out_tx_clone.send(frame).await.is_err() {
                         break;
                     }
                 }
@@ -262,7 +293,7 @@ async fn proxy_conn(
                 }
             }
         }
-        let _ = out_tx_clone.send(Frame::close(conn_id).encode());
+        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
     });
 
     let writer = tokio::spawn(async move {
