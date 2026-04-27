@@ -18,9 +18,19 @@ use tracing::{error, info, warn};
 // ── App state ─────────────────────────────────────────────────────────────────
 
 struct AppState {
-    tunnel_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    conn_map: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
+    tunnel_tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    conn_map: Mutex<HashMap<u32, ConnEntry>>,
     next_id: AtomicU32,
+}
+
+struct ConnEntry {
+    tx: mpsc::UnboundedSender<ProxyMsg>,
+    remote_closed: bool,
+}
+
+enum ProxyMsg {
+    Data(Vec<u8>),
+    Close,
 }
 
 impl AppState {
@@ -106,7 +116,7 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     info!("Tunnel client connected");
 
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     {
         let mut guard = state.tunnel_tx.lock().await;
@@ -152,15 +162,31 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
 async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
     match frame.frame_type {
         FRAME_DATA => {
-            let map = state.conn_map.lock().await;
-            if let Some(tx) = map.get(&frame.conn_id) {
-                let _ = tx.send(frame.payload).await;
+            let tx = {
+                let map = state.conn_map.lock().await;
+                map.get(&frame.conn_id).map(|entry| entry.tx.clone())
+            };
+
+            if let Some(tx) = tx {
+                let _ = tx.send(ProxyMsg::Data(frame.payload));
             } else {
                 warn!("DATA for unknown conn_id {}", frame.conn_id);
             }
         }
         FRAME_CLOSE => {
-            state.conn_map.lock().await.remove(&frame.conn_id);
+            let tx = {
+                let mut map = state.conn_map.lock().await;
+                match map.get_mut(&frame.conn_id) {
+                    Some(entry) if !entry.remote_closed => {
+                        entry.remote_closed = true;
+                        Some(entry.tx.clone())
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(ProxyMsg::Close);
+            }
         }
         other => {
             warn!("Unexpected frame type {:#04x} from tunnel", other);
@@ -184,10 +210,16 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
 
     let conn_id = state.next_conn_id();
 
-    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
-    state.conn_map.lock().await.insert(conn_id, data_tx);
+    let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
+    state.conn_map.lock().await.insert(
+        conn_id,
+        ConnEntry {
+            tx: data_tx,
+            remote_closed: false,
+        },
+    );
 
-    if tunnel_tx.send(Frame::open(conn_id).encode()).await.is_err() {
+    if tunnel_tx.send(Frame::open(conn_id).encode()).is_err() {
         state.conn_map.lock().await.remove(&conn_id);
         return;
     }
@@ -204,7 +236,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                 Ok(0) => break,
                 Ok(n) => {
                     let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
-                    if tunnel_tx_clone.send(frame).await.is_err() {
+                    if tunnel_tx_clone.send(frame).is_err() {
                         break;
                     }
                 }
@@ -214,14 +246,19 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                 }
             }
         }
-        let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode()).await;
+        let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode());
     });
 
     let writer = tokio::spawn(async move {
         let mut rx = data_rx;
-        while let Some(data) = rx.recv().await {
-            if tcp_tx.write_all(&data).await.is_err() {
-                break;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ProxyMsg::Data(data) => {
+                    if tcp_tx.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                ProxyMsg::Close => break,
             }
         }
         let _ = tcp_tx.shutdown().await;

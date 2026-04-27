@@ -12,11 +12,22 @@ use tracing::{error, info, warn};
 // ── Connection state ──────────────────────────────────────────────────────────
 
 enum ConnEntry {
-    Connecting(Vec<Vec<u8>>),
-    Connected(mpsc::Sender<Vec<u8>>),
+    Connecting {
+        buffered: Vec<Vec<u8>>,
+        remote_closed: bool,
+    },
+    Connected {
+        tx: mpsc::UnboundedSender<ProxyMsg>,
+        remote_closed: bool,
+    },
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
+
+enum ProxyMsg {
+    Data(Vec<u8>),
+    Close,
+}
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
@@ -45,7 +56,7 @@ async fn run_client(
     upstream: String,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = out_rx.recv().await {
@@ -89,7 +100,7 @@ async fn run_client(
 
 async fn handle_frame(
     frame: Frame,
-    out_tx: mpsc::Sender<Vec<u8>>,
+    out_tx: mpsc::UnboundedSender<Vec<u8>>,
     upstream: String,
     conn_map: ConnMap,
 ) {
@@ -97,10 +108,13 @@ async fn handle_frame(
         FRAME_OPEN => {
             let conn_id = frame.conn_id;
 
-            conn_map
-                .lock()
-                .await
-                .insert(conn_id, ConnEntry::Connecting(Vec::new()));
+            conn_map.lock().await.insert(
+                conn_id,
+                ConnEntry::Connecting {
+                    buffered: Vec::new(),
+                    remote_closed: false,
+                },
+            );
 
             let out_tx_clone = out_tx.clone();
             let conn_map_clone = Arc::clone(&conn_map);
@@ -110,23 +124,45 @@ async fn handle_frame(
                     Ok(stream) => {
                         info!("Opened upstream connection for conn {}", conn_id);
 
-                        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+                        let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
 
-                        let buffered = {
+                        let (buffered, remote_closed) = {
                             let mut map = conn_map_clone.lock().await;
                             match map.get_mut(&conn_id) {
-                                Some(ConnEntry::Connecting(buf)) => {
-                                    let drained = std::mem::take(buf);
-                                    *map.get_mut(&conn_id).unwrap() =
-                                        ConnEntry::Connected(data_tx.clone());
-                                    drained
+                                Some(ConnEntry::Connecting {
+                                    buffered,
+                                    remote_closed,
+                                }) => {
+                                    let drained = std::mem::take(buffered);
+                                    let remote_closed = *remote_closed;
+                                    *map.get_mut(&conn_id).unwrap() = ConnEntry::Connected {
+                                        tx: data_tx.clone(),
+                                        remote_closed: false,
+                                    };
+                                    (drained, remote_closed)
                                 }
                                 _ => return,
                             }
                         };
 
                         for chunk in buffered {
-                            let _ = data_tx.send(chunk).await;
+                            let _ = data_tx.send(ProxyMsg::Data(chunk));
+                        }
+
+                        if remote_closed {
+                            let tx = {
+                                let mut map = conn_map_clone.lock().await;
+                                match map.get_mut(&conn_id) {
+                                    Some(ConnEntry::Connected { tx, remote_closed }) => {
+                                        *remote_closed = true;
+                                        Some(tx.clone())
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if let Some(tx) = tx {
+                                let _ = tx.send(ProxyMsg::Close);
+                            }
                         }
 
                         proxy_conn(conn_id, stream, data_rx, out_tx_clone, conn_map_clone).await;
@@ -137,29 +173,58 @@ async fn handle_frame(
                             upstream, conn_id, e
                         );
                         conn_map_clone.lock().await.remove(&conn_id);
-                        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
+                        let _ = out_tx_clone.send(Frame::close(conn_id).encode());
                     }
                 }
             });
         }
 
         FRAME_DATA => {
-            let mut map = conn_map.lock().await;
-            match map.get_mut(&frame.conn_id) {
-                Some(ConnEntry::Connected(tx)) => {
-                    let _ = tx.send(frame.payload).await;
+            let mut payload = Some(frame.payload);
+            let tx = {
+                let mut map = conn_map.lock().await;
+                match map.get_mut(&frame.conn_id) {
+                    Some(ConnEntry::Connected { tx, remote_closed }) => {
+                        if *remote_closed {
+                            None
+                        } else {
+                            Some(tx.clone())
+                        }
+                    }
+                    Some(ConnEntry::Connecting { buffered, .. }) => {
+                        buffered.push(payload.take().unwrap());
+                        None
+                    }
+                    None => {
+                        warn!("DATA for unknown conn_id {}", frame.conn_id);
+                        None
+                    }
                 }
-                Some(ConnEntry::Connecting(buf)) => {
-                    buf.push(frame.payload);
-                }
-                None => {
-                    warn!("DATA for unknown conn_id {}", frame.conn_id);
-                }
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(ProxyMsg::Data(payload.take().unwrap()));
             }
         }
 
         FRAME_CLOSE => {
-            conn_map.lock().await.remove(&frame.conn_id);
+            let tx = {
+                let mut map = conn_map.lock().await;
+                match map.get_mut(&frame.conn_id) {
+                    Some(ConnEntry::Connected { tx, remote_closed }) if !*remote_closed => {
+                        *remote_closed = true;
+                        Some(tx.clone())
+                    }
+                    Some(ConnEntry::Connected { .. }) => None,
+                    Some(ConnEntry::Connecting { remote_closed, .. }) => {
+                        *remote_closed = true;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(ProxyMsg::Close);
+            }
         }
 
         other => {
@@ -173,8 +238,8 @@ async fn handle_frame(
 async fn proxy_conn(
     conn_id: u32,
     stream: TcpStream,
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
-    out_tx: mpsc::Sender<Vec<u8>>,
+    mut data_rx: mpsc::UnboundedReceiver<ProxyMsg>,
+    out_tx: mpsc::UnboundedSender<Vec<u8>>,
     conn_map: ConnMap,
 ) {
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
@@ -187,7 +252,7 @@ async fn proxy_conn(
                 Ok(0) => break,
                 Ok(n) => {
                     let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
-                    if out_tx_clone.send(frame).await.is_err() {
+                    if out_tx_clone.send(frame).is_err() {
                         break;
                     }
                 }
@@ -197,13 +262,18 @@ async fn proxy_conn(
                 }
             }
         }
-        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
+        let _ = out_tx_clone.send(Frame::close(conn_id).encode());
     });
 
     let writer = tokio::spawn(async move {
-        while let Some(data) = data_rx.recv().await {
-            if tcp_tx.write_all(&data).await.is_err() {
-                break;
+        while let Some(msg) = data_rx.recv().await {
+            match msg {
+                ProxyMsg::Data(data) => {
+                    if tcp_tx.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                ProxyMsg::Close => break,
             }
         }
         let _ = tcp_tx.shutdown().await;
