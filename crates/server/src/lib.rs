@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 
 struct AppState {
     tunnel_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    conn_map: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
+    conn_map: Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
     next_id: AtomicU32,
 }
 
@@ -154,7 +154,8 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
         FRAME_DATA => {
             let map = state.conn_map.lock().await;
             if let Some(tx) = map.get(&frame.conn_id) {
-                let _ = tx.send(frame.payload).await;
+                // UnboundedSender::send is synchronous — never blocks the dispatch loop.
+                let _ = tx.send(frame.payload);
             } else {
                 warn!("DATA for unknown conn_id {}", frame.conn_id);
             }
@@ -191,7 +192,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
 
     let conn_id = state.next_conn_id();
 
-    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (data_tx, data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     state.conn_map.lock().await.insert(conn_id, data_tx);
 
     if tunnel_tx.send(Frame::open(conn_id).encode()).await.is_err() {
@@ -204,7 +205,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
     let tunnel_tx_clone = tunnel_tx.clone();
 
-    let reader = tokio::spawn(async move {
+    let mut reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         let mut normal_exit = true;
         loop {
@@ -236,7 +237,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         normal_exit
     });
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         let mut rx = data_rx;
         while let Some(data) = rx.recv().await {
             if tcp_tx.write_all(&data).await.is_err() {
@@ -245,9 +246,6 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         }
         let _ = tcp_tx.shutdown().await;
     });
-
-    let mut reader = reader;
-    let mut writer = writer;
 
     tokio::select! {
         r = &mut reader => {

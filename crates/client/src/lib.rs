@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 
 enum ConnEntry {
     Connecting(Vec<Vec<u8>>),
-    Connected(mpsc::Sender<Vec<u8>>),
+    Connected(mpsc::UnboundedSender<Vec<u8>>),
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
@@ -110,7 +110,7 @@ async fn handle_frame(
                     Ok(stream) => {
                         info!("Opened upstream connection for conn {}", conn_id);
 
-                        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+                        let (data_tx, data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
                         let buffered = {
                             let mut map = conn_map_clone.lock().await;
@@ -126,7 +126,7 @@ async fn handle_frame(
                         };
 
                         for chunk in buffered {
-                            let _ = data_tx.send(chunk).await;
+                            let _ = data_tx.send(chunk);
                         }
 
                         proxy_conn(conn_id, stream, data_rx, out_tx_clone, conn_map_clone).await;
@@ -147,7 +147,8 @@ async fn handle_frame(
             let mut map = conn_map.lock().await;
             match map.get_mut(&frame.conn_id) {
                 Some(ConnEntry::Connected(tx)) => {
-                    let _ = tx.send(frame.payload).await;
+                    // UnboundedSender::send is synchronous — never blocks the dispatch loop.
+                    let _ = tx.send(frame.payload);
                 }
                 Some(ConnEntry::Connecting(buf)) => {
                     buf.push(frame.payload);
@@ -181,14 +182,14 @@ async fn handle_frame(
 async fn proxy_conn(
     conn_id: u32,
     stream: TcpStream,
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     out_tx: mpsc::Sender<Vec<u8>>,
     conn_map: ConnMap,
 ) {
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
     let out_tx_clone = out_tx.clone();
 
-    let reader = tokio::spawn(async move {
+    let mut reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         let mut normal_exit = true;
         loop {
@@ -220,7 +221,7 @@ async fn proxy_conn(
         normal_exit
     });
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(data) = data_rx.recv().await {
             if tcp_tx.write_all(&data).await.is_err() {
                 break;
@@ -228,9 +229,6 @@ async fn proxy_conn(
         }
         let _ = tcp_tx.shutdown().await;
     });
-
-    let mut reader = reader;
-    let mut writer = writer;
 
     tokio::select! {
         r = &mut reader => {
