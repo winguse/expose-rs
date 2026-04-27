@@ -212,6 +212,61 @@ async fn test_half_close_still_receives_response() {
     client_task.abort();
 }
 
+/// Upstream that waits for the tunnel to half-close (FIN), then sends bytes.
+/// Reproduces iperf-style flows where results travel after the client stops sending.
+async fn start_half_close_upstream() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut rx, mut tx) = stream.into_split();
+                        let mut sink = Vec::new();
+                        let _ = rx.read_to_end(&mut sink).await;
+                        let _ = tx.write_all(b"after-fin").await;
+                        let _ = tx.shutdown().await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
+/// Half-close from the proxied TCP side: peer sends FIN first; upstream must still
+/// be able to deliver data back (iperf reverse / JSON results).
+#[tokio::test]
+async fn test_half_close_then_upstream_response() {
+    let upstream = start_half_close_upstream().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_response = false;
+    while tokio::time::Instant::now() < deadline && !saw_response {
+        if let Ok(mut stream) = TcpStream::connect(server_addr).await {
+            let _ = stream.shutdown().await;
+            let mut buf = [0u8; 32];
+            if let Ok(Ok(n)) = timeout(Duration::from_millis(400), stream.read(&mut buf)).await {
+                if n > 0 && &buf[..n] == b"after-fin" {
+                    saw_response = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        saw_response,
+        "expected upstream response after half-close (tunnel may not be ready)"
+    );
+
+    server_task.abort();
+    client_task.abort();
+}
+
 /// After a connection closes (EOF), the tunnel correctly handles a new
 /// connection on the same port.
 #[tokio::test]
