@@ -1,4 +1,4 @@
-use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
+use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA, FRAME_HALF_CLOSE, FRAME_OPEN};
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
@@ -162,6 +162,14 @@ async fn handle_frame(
             conn_map.lock().await.remove(&frame.conn_id);
         }
 
+        FRAME_HALF_CLOSE => {
+            // The remote downstream finished sending; drop the data sender so the
+            // client-side writer shuts down its write half to the upstream.
+            // The client-side reader keeps running to forward any remaining upstream
+            // data back through the tunnel (e.g. iperf3 server-side result JSON).
+            conn_map.lock().await.remove(&frame.conn_id);
+        }
+
         other => {
             warn!("Unexpected frame type {:#04x} from server", other);
         }
@@ -182,22 +190,34 @@ async fn proxy_conn(
 
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
+        let mut normal_exit = true;
         loop {
             match tcp_rx.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
                     let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
                     if out_tx_clone.send(frame).await.is_err() {
+                        normal_exit = false;
                         break;
                     }
                 }
                 Err(e) => {
                     error!("Read from upstream error for conn {}: {}", conn_id, e);
+                    normal_exit = false;
                     break;
                 }
             }
         }
-        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
+        // On a normal EOF send FRAME_HALF_CLOSE so the remote shuts down its write
+        // half while keeping the other direction alive.  On error send FRAME_CLOSE
+        // to tear down the whole connection immediately.
+        let close_frame = if normal_exit {
+            Frame::half_close(conn_id).encode()
+        } else {
+            Frame::close(conn_id).encode()
+        };
+        let _ = out_tx_clone.send(close_frame).await;
+        normal_exit
     });
 
     let writer = tokio::spawn(async move {
@@ -209,9 +229,28 @@ async fn proxy_conn(
         let _ = tcp_tx.shutdown().await;
     });
 
+    let mut reader = reader;
+    let mut writer = writer;
+
     tokio::select! {
-        _ = reader => {}
-        _ = writer => {}
+        r = &mut reader => {
+            let normal_exit = r.unwrap_or(false);
+            if normal_exit {
+                // Reader done normally (upstream EOF, FRAME_HALF_CLOSE sent).
+                // Wait for the writer to drain the other direction and finish.
+                let _ = writer.await;
+            } else {
+                // Reader errored (FRAME_CLOSE sent); abort the writer immediately.
+                writer.abort();
+                let _ = writer.await;
+            }
+        }
+        _ = &mut writer => {
+            // Writer finished (data channel closed after receiving FRAME_HALF_CLOSE
+            // or FRAME_CLOSE from the remote, or a write error).
+            // Keep the reader running so the other direction can complete.
+            let _ = reader.await;
+        }
     }
 
     conn_map.lock().await.remove(&conn_id);

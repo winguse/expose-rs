@@ -8,6 +8,10 @@ pub const FRAME_OPEN: u8 = 0x01;
 pub const FRAME_DATA: u8 = 0x02;
 /// Bidirectional: TCP connection closed.  Payload is empty.
 pub const FRAME_CLOSE: u8 = 0x03;
+/// Bidirectional: one direction of the TCP connection has reached EOF (half-close).
+/// The receiver should shut down its local write half but keep reading.
+/// Payload is empty.
+pub const FRAME_HALF_CLOSE: u8 = 0x04;
 
 // ── Wire layout ──────────────────────────────────────────────────────────────
 //
@@ -49,6 +53,14 @@ impl Frame {
         Frame {
             conn_id,
             frame_type: FRAME_CLOSE,
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn half_close(conn_id: u32) -> Self {
+        Frame {
+            conn_id,
+            frame_type: FRAME_HALF_CLOSE,
             payload: Vec::new(),
         }
     }
