@@ -1,4 +1,4 @@
-use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
+use expose_common::{Frame, TcpWriterCmd, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
@@ -12,8 +12,12 @@ use tracing::{error, info, warn};
 // ── Connection state ──────────────────────────────────────────────────────────
 
 enum ConnEntry {
-    Connecting(Vec<Vec<u8>>),
-    Connected(mpsc::Sender<Vec<u8>>),
+    Connecting {
+        buf: Vec<Vec<u8>>,
+        /// Proxied side sent FIN before upstream connect finished.
+        pending_shutdown: bool,
+    },
+    Connected(mpsc::Sender<TcpWriterCmd>),
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
@@ -97,10 +101,13 @@ async fn handle_frame(
         FRAME_OPEN => {
             let conn_id = frame.conn_id;
 
-            conn_map
-                .lock()
-                .await
-                .insert(conn_id, ConnEntry::Connecting(Vec::new()));
+            conn_map.lock().await.insert(
+                conn_id,
+                ConnEntry::Connecting {
+                    buf: Vec::new(),
+                    pending_shutdown: false,
+                },
+            );
 
             let out_tx_clone = out_tx.clone();
             let conn_map_clone = Arc::clone(&conn_map);
@@ -110,23 +117,30 @@ async fn handle_frame(
                     Ok(stream) => {
                         info!("Opened upstream connection for conn {}", conn_id);
 
-                        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+                        let (data_tx, data_rx) = mpsc::channel::<TcpWriterCmd>(64);
 
-                        let buffered = {
+                        let (buffered, do_shutdown) = {
                             let mut map = conn_map_clone.lock().await;
                             match map.get_mut(&conn_id) {
-                                Some(ConnEntry::Connecting(buf)) => {
+                                Some(ConnEntry::Connecting {
+                                    buf,
+                                    pending_shutdown,
+                                }) => {
                                     let drained = std::mem::take(buf);
+                                    let do_shutdown = *pending_shutdown;
                                     *map.get_mut(&conn_id).unwrap() =
                                         ConnEntry::Connected(data_tx.clone());
-                                    drained
+                                    (drained, do_shutdown)
                                 }
                                 _ => return,
                             }
                         };
 
                         for chunk in buffered {
-                            let _ = data_tx.send(chunk).await;
+                            let _ = data_tx.send(TcpWriterCmd::Payload(chunk)).await;
+                        }
+                        if do_shutdown {
+                            let _ = data_tx.send(TcpWriterCmd::ShutdownWrite).await;
                         }
 
                         proxy_conn(conn_id, stream, data_rx, out_tx_clone, conn_map_clone).await;
@@ -147,9 +161,9 @@ async fn handle_frame(
             let mut map = conn_map.lock().await;
             match map.get_mut(&frame.conn_id) {
                 Some(ConnEntry::Connected(tx)) => {
-                    let _ = tx.send(frame.payload).await;
+                    let _ = tx.send(TcpWriterCmd::Payload(frame.payload)).await;
                 }
-                Some(ConnEntry::Connecting(buf)) => {
+                Some(ConnEntry::Connecting { buf, .. }) => {
                     buf.push(frame.payload);
                 }
                 None => {
@@ -159,7 +173,18 @@ async fn handle_frame(
         }
 
         FRAME_CLOSE => {
-            conn_map.lock().await.remove(&frame.conn_id);
+            let mut map = conn_map.lock().await;
+            match map.get_mut(&frame.conn_id) {
+                Some(ConnEntry::Connected(tx)) => {
+                    let _ = tx.send(TcpWriterCmd::ShutdownWrite).await;
+                }
+                Some(ConnEntry::Connecting {
+                    pending_shutdown, ..
+                }) => {
+                    *pending_shutdown = true;
+                }
+                None => {}
+            }
         }
 
         other => {
@@ -173,7 +198,7 @@ async fn handle_frame(
 async fn proxy_conn(
     conn_id: u32,
     stream: TcpStream,
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    mut data_rx: mpsc::Receiver<TcpWriterCmd>,
     out_tx: mpsc::Sender<Vec<u8>>,
     conn_map: ConnMap,
 ) {
@@ -201,18 +226,28 @@ async fn proxy_conn(
     });
 
     let writer = tokio::spawn(async move {
-        while let Some(data) = data_rx.recv().await {
-            if tcp_tx.write_all(&data).await.is_err() {
-                break;
+        let mut write_half_closed = false;
+        while let Some(cmd) = data_rx.recv().await {
+            match cmd {
+                TcpWriterCmd::Payload(data) => {
+                    if tcp_tx.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                TcpWriterCmd::ShutdownWrite => {
+                    let _ = tcp_tx.shutdown().await;
+                    write_half_closed = true;
+                    break;
+                }
             }
         }
-        let _ = tcp_tx.shutdown().await;
+        if !write_half_closed {
+            let _ = tcp_tx.shutdown().await;
+        }
     });
 
-    tokio::select! {
-        _ = reader => {}
-        _ = writer => {}
-    }
+    let (read_res, write_res) = tokio::join!(reader, writer);
+    let _ = (read_res, write_res);
 
     conn_map.lock().await.remove(&conn_id);
     info!("Upstream connection for conn {} closed", conn_id);

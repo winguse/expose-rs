@@ -1,4 +1,4 @@
-use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA};
+use expose_common::{Frame, TcpWriterCmd, FRAME_CLOSE, FRAME_DATA};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 
 struct AppState {
     tunnel_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    conn_map: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
+    conn_map: Mutex<HashMap<u32, mpsc::Sender<TcpWriterCmd>>>,
     next_id: AtomicU32,
 }
 
@@ -154,13 +154,16 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
         FRAME_DATA => {
             let map = state.conn_map.lock().await;
             if let Some(tx) = map.get(&frame.conn_id) {
-                let _ = tx.send(frame.payload).await;
+                let _ = tx.send(TcpWriterCmd::Payload(frame.payload)).await;
             } else {
                 warn!("DATA for unknown conn_id {}", frame.conn_id);
             }
         }
         FRAME_CLOSE => {
-            state.conn_map.lock().await.remove(&frame.conn_id);
+            let map = state.conn_map.lock().await;
+            if let Some(tx) = map.get(&frame.conn_id) {
+                let _ = tx.send(TcpWriterCmd::ShutdownWrite).await;
+            }
         }
         other => {
             warn!("Unexpected frame type {:#04x} from tunnel", other);
@@ -184,7 +187,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
 
     let conn_id = state.next_conn_id();
 
-    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (data_tx, data_rx) = mpsc::channel::<TcpWriterCmd>(64);
     state.conn_map.lock().await.insert(conn_id, data_tx);
 
     if tunnel_tx.send(Frame::open(conn_id).encode()).await.is_err() {
@@ -219,18 +222,28 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
 
     let writer = tokio::spawn(async move {
         let mut rx = data_rx;
-        while let Some(data) = rx.recv().await {
-            if tcp_tx.write_all(&data).await.is_err() {
-                break;
+        let mut write_half_closed = false;
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                TcpWriterCmd::Payload(data) => {
+                    if tcp_tx.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                TcpWriterCmd::ShutdownWrite => {
+                    let _ = tcp_tx.shutdown().await;
+                    write_half_closed = true;
+                    break;
+                }
             }
         }
-        let _ = tcp_tx.shutdown().await;
+        if !write_half_closed {
+            let _ = tcp_tx.shutdown().await;
+        }
     });
 
-    tokio::select! {
-        _ = reader => {}
-        _ = writer => {}
-    }
+    let (read_res, write_res) = tokio::join!(reader, writer);
+    let _ = (read_res, write_res);
 
     state.conn_map.lock().await.remove(&conn_id);
     info!("Proxied connection {} closed", conn_id);

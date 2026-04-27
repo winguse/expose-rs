@@ -37,6 +37,30 @@ async fn start_echo_server() -> std::net::SocketAddr {
     addr
 }
 
+/// Upstream that waits for the tunnel to half-close (FIN), then sends bytes.
+/// Reproduces iperf-style flows where results travel after the client stops sending.
+async fn start_half_close_upstream() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut rx, mut tx) = stream.into_split();
+                        let mut sink = Vec::new();
+                        let _ = rx.read_to_end(&mut sink).await;
+                        let _ = tx.write_all(b"after-fin").await;
+                        let _ = tx.shutdown().await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
 /// Spawn expose-server + expose-client pointing at `upstream`.
 /// Returns the server's listening address and the two task handles (so the
 /// caller can abort them when the test is done).
@@ -173,9 +197,8 @@ async fn test_large_data() {
     stream.write_all(&payload).await.unwrap();
 
     // Read back exactly as many bytes as we sent (the echo server mirrors the
-    // data). We do NOT close the write-side before reading: sending a TCP FIN
-    // currently causes the tunnel to emit a CLOSE frame which tears down the
-    // full connection before in-flight echo data can return.
+    // data). Half-close handling allows FIN before the full read if desired;
+    // here we keep the write side open until the read completes.
     let mut received = vec![0u8; payload.len()];
     timeout(Duration::from_secs(15), stream.read_exact(&mut received))
         .await
@@ -183,6 +206,37 @@ async fn test_large_data() {
         .expect("read failed");
 
     assert_eq!(received, payload);
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// Half-close from the proxied TCP side: peer sends FIN first; upstream must still
+/// be able to deliver data back (iperf reverse / JSON results).
+#[tokio::test]
+async fn test_half_close_then_upstream_response() {
+    let upstream = start_half_close_upstream().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_response = false;
+    while tokio::time::Instant::now() < deadline && !saw_response {
+        if let Ok(mut stream) = TcpStream::connect(server_addr).await {
+            let _ = stream.shutdown().await;
+            let mut buf = [0u8; 32];
+            if let Ok(Ok(n)) = timeout(Duration::from_millis(400), stream.read(&mut buf)).await {
+                if n > 0 && &buf[..n] == b"after-fin" {
+                    saw_response = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        saw_response,
+        "expected upstream response after half-close (tunnel may not be ready)"
+    );
 
     server_task.abort();
     client_task.abort();

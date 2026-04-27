@@ -9,6 +9,14 @@ pub const FRAME_DATA: u8 = 0x02;
 /// Bidirectional: TCP connection closed.  Payload is empty.
 pub const FRAME_CLOSE: u8 = 0x03;
 
+/// Inbound message to the local TCP writer task (not on the wire).
+#[derive(Debug)]
+pub enum TcpWriterCmd {
+    Payload(Vec<u8>),
+    /// Peer closed their send direction; half-close the local TCP write side.
+    ShutdownWrite,
+}
+
 // ── Wire layout ──────────────────────────────────────────────────────────────
 //
 //  +──────────────────+──────────────+──────────────────+──────────────────+
