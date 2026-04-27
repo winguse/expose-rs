@@ -1,30 +1,35 @@
 use expose_common::{Frame, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{mpsc, Mutex},
+    time::{sleep, Duration},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
 // ── Connection state ──────────────────────────────────────────────────────────
 
-pub const DEFAULT_WS_SEND_CHANNEL_CAPACITY: usize = 1024;
-pub const DEFAULT_CONNECTION_CHANNEL_CAPACITY: usize = 256;
+pub const DEFAULT_MAX_IN_FLIGHT_FRAMES_PER_CONNECTION: usize = 4096;
+const INFLIGHT_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct CapacityConfig {
-    pub ws_send_channel_capacity: usize,
-    pub connection_channel_capacity: usize,
+    pub max_in_flight_frames_per_connection: usize,
 }
 
 impl Default for CapacityConfig {
     fn default() -> Self {
         CapacityConfig {
-            ws_send_channel_capacity: DEFAULT_WS_SEND_CHANNEL_CAPACITY,
-            connection_channel_capacity: DEFAULT_CONNECTION_CHANNEL_CAPACITY,
+            max_in_flight_frames_per_connection: DEFAULT_MAX_IN_FLIGHT_FRAMES_PER_CONNECTION,
         }
     }
 }
@@ -35,8 +40,9 @@ enum ConnEntry {
         remote_closed: bool,
     },
     Connected {
-        tx: mpsc::Sender<ProxyMsg>,
+        tx: mpsc::UnboundedSender<ProxyMsg>,
         remote_closed: bool,
+        queued_to_upstream: Arc<AtomicUsize>,
     },
 }
 
@@ -45,6 +51,38 @@ type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
 enum ProxyMsg {
     Data(Vec<u8>),
     Close,
+}
+
+enum WsOutMsg {
+    Frame(Vec<u8>),
+    Data {
+        bytes: Vec<u8>,
+        inflight_counter: Arc<AtomicUsize>,
+    },
+}
+
+fn decrement_counter(counter: &AtomicUsize) {
+    let mut current = counter.load(Ordering::Acquire);
+    while current > 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
+    }
+}
+
+async fn wait_for_slot(counter: &AtomicUsize, max_inflight: usize) {
+    if max_inflight == 0 {
+        return;
+    }
+    while counter.load(Ordering::Acquire) >= max_inflight {
+        sleep(INFLIGHT_WAIT_POLL_INTERVAL).await;
+    }
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -58,7 +96,7 @@ pub async fn run_client_once(server_url: String, upstream: String) {
 }
 
 /// Connect to the expose-rs server once and relay connections to `upstream`,
-/// using explicit bounded channel capacities.
+/// using explicit per-connection in-flight limits.
 pub async fn run_client_once_with_channel_config(
     server_url: String,
     upstream: String,
@@ -85,12 +123,27 @@ async fn run_client(
     channel_config: CapacityConfig,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(channel_config.ws_send_channel_capacity);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsOutMsg>();
 
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = out_rx.recv().await {
+        while let Some(msg) = out_rx.recv().await {
+            let (bytes, inflight_counter) = match msg {
+                WsOutMsg::Frame(bytes) => (bytes, None),
+                WsOutMsg::Data {
+                    bytes,
+                    inflight_counter,
+                } => (bytes, Some(inflight_counter)),
+            };
+
             if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                if let Some(counter) = inflight_counter {
+                    decrement_counter(&counter);
+                }
                 break;
+            }
+
+            if let Some(counter) = inflight_counter {
+                decrement_counter(&counter);
             }
         }
         let _ = ws_tx.close().await;
@@ -107,7 +160,7 @@ async fn run_client(
                         out_tx.clone(),
                         upstream.clone(),
                         Arc::clone(&conn_map),
-                        channel_config.connection_channel_capacity,
+                        channel_config.max_in_flight_frames_per_connection,
                     )
                     .await;
                 }
@@ -130,10 +183,10 @@ async fn run_client(
 
 async fn handle_frame(
     frame: Frame,
-    out_tx: mpsc::Sender<Vec<u8>>,
+    out_tx: mpsc::UnboundedSender<WsOutMsg>,
     upstream: String,
     conn_map: ConnMap,
-    conn_channel_capacity: usize,
+    max_in_flight_frames_per_connection: usize,
 ) {
     match frame.frame_type {
         FRAME_OPEN => {
@@ -155,7 +208,8 @@ async fn handle_frame(
                     Ok(stream) => {
                         info!("Opened upstream connection for conn {}", conn_id);
 
-                        let (data_tx, data_rx) = mpsc::channel::<ProxyMsg>(conn_channel_capacity);
+                        let queued_to_upstream = Arc::new(AtomicUsize::new(0));
+                        let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
 
                         let (buffered, remote_closed) = {
                             let mut map = conn_map_clone.lock().await;
@@ -169,6 +223,7 @@ async fn handle_frame(
                                     *map.get_mut(&conn_id).unwrap() = ConnEntry::Connected {
                                         tx: data_tx.clone(),
                                         remote_closed: false,
+                                        queued_to_upstream: Arc::clone(&queued_to_upstream),
                                     };
                                     (drained, remote_closed)
                                 }
@@ -177,14 +232,22 @@ async fn handle_frame(
                         };
 
                         for chunk in buffered {
-                            let _ = data_tx.send(ProxyMsg::Data(chunk)).await;
+                            wait_for_slot(&queued_to_upstream, max_in_flight_frames_per_connection)
+                                .await;
+                            queued_to_upstream.fetch_add(1, Ordering::AcqRel);
+                            if data_tx.send(ProxyMsg::Data(chunk)).is_err() {
+                                decrement_counter(&queued_to_upstream);
+                                break;
+                            }
                         }
 
                         if remote_closed {
                             let tx = {
                                 let mut map = conn_map_clone.lock().await;
                                 match map.get_mut(&conn_id) {
-                                    Some(ConnEntry::Connected { tx, remote_closed }) => {
+                                    Some(ConnEntry::Connected {
+                                        tx, remote_closed, ..
+                                    }) => {
                                         *remote_closed = true;
                                         Some(tx.clone())
                                     }
@@ -192,11 +255,20 @@ async fn handle_frame(
                                 }
                             };
                             if let Some(tx) = tx {
-                                let _ = tx.send(ProxyMsg::Close).await;
+                                let _ = tx.send(ProxyMsg::Close);
                             }
                         }
 
-                        proxy_conn(conn_id, stream, data_rx, out_tx_clone, conn_map_clone).await;
+                        proxy_conn(
+                            conn_id,
+                            stream,
+                            data_rx,
+                            out_tx_clone,
+                            conn_map_clone,
+                            queued_to_upstream,
+                            max_in_flight_frames_per_connection,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         error!(
@@ -204,7 +276,7 @@ async fn handle_frame(
                             upstream, conn_id, e
                         );
                         conn_map_clone.lock().await.remove(&conn_id);
-                        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
+                        let _ = out_tx_clone.send(WsOutMsg::Frame(Frame::close(conn_id).encode()));
                     }
                 }
             });
@@ -212,14 +284,18 @@ async fn handle_frame(
 
         FRAME_DATA => {
             let mut payload = Some(frame.payload);
-            let tx = {
+            let conn = {
                 let mut map = conn_map.lock().await;
                 match map.get_mut(&frame.conn_id) {
-                    Some(ConnEntry::Connected { tx, remote_closed }) => {
+                    Some(ConnEntry::Connected {
+                        tx,
+                        remote_closed,
+                        queued_to_upstream,
+                    }) => {
                         if *remote_closed {
                             None
                         } else {
-                            Some(tx.clone())
+                            Some((tx.clone(), Arc::clone(queued_to_upstream)))
                         }
                     }
                     Some(ConnEntry::Connecting { buffered, .. }) => {
@@ -232,8 +308,12 @@ async fn handle_frame(
                     }
                 }
             };
-            if let Some(tx) = tx {
-                let _ = tx.send(ProxyMsg::Data(payload.take().unwrap())).await;
+            if let Some((tx, queued_to_upstream)) = conn {
+                wait_for_slot(&queued_to_upstream, max_in_flight_frames_per_connection).await;
+                queued_to_upstream.fetch_add(1, Ordering::AcqRel);
+                if tx.send(ProxyMsg::Data(payload.take().unwrap())).is_err() {
+                    decrement_counter(&queued_to_upstream);
+                }
             }
         }
 
@@ -241,7 +321,9 @@ async fn handle_frame(
             let tx = {
                 let mut map = conn_map.lock().await;
                 match map.get_mut(&frame.conn_id) {
-                    Some(ConnEntry::Connected { tx, remote_closed }) if !*remote_closed => {
+                    Some(ConnEntry::Connected {
+                        tx, remote_closed, ..
+                    }) if !*remote_closed => {
                         *remote_closed = true;
                         Some(tx.clone())
                     }
@@ -254,7 +336,7 @@ async fn handle_frame(
                 }
             };
             if let Some(tx) = tx {
-                let _ = tx.send(ProxyMsg::Close).await;
+                let _ = tx.send(ProxyMsg::Close);
             }
         }
 
@@ -269,21 +351,36 @@ async fn handle_frame(
 async fn proxy_conn(
     conn_id: u32,
     stream: TcpStream,
-    mut data_rx: mpsc::Receiver<ProxyMsg>,
-    out_tx: mpsc::Sender<Vec<u8>>,
+    mut data_rx: mpsc::UnboundedReceiver<ProxyMsg>,
+    out_tx: mpsc::UnboundedSender<WsOutMsg>,
     conn_map: ConnMap,
+    queued_to_upstream: Arc<AtomicUsize>,
+    max_in_flight_frames_per_connection: usize,
 ) {
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
     let out_tx_clone = out_tx.clone();
+    let to_tunnel_inflight = Arc::new(AtomicUsize::new(0));
+    let to_tunnel_inflight_reader = Arc::clone(&to_tunnel_inflight);
 
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
+            wait_for_slot(
+                &to_tunnel_inflight_reader,
+                max_in_flight_frames_per_connection,
+            )
+            .await;
+
             match tcp_rx.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
-                    if out_tx_clone.send(frame).await.is_err() {
+                    to_tunnel_inflight_reader.fetch_add(1, Ordering::AcqRel);
+                    let msg = WsOutMsg::Data {
+                        bytes: Frame::data(conn_id, buf[..n].to_vec()).encode(),
+                        inflight_counter: Arc::clone(&to_tunnel_inflight_reader),
+                    };
+                    if out_tx_clone.send(msg).is_err() {
+                        decrement_counter(&to_tunnel_inflight_reader);
                         break;
                     }
                 }
@@ -293,13 +390,14 @@ async fn proxy_conn(
                 }
             }
         }
-        let _ = out_tx_clone.send(Frame::close(conn_id).encode()).await;
+        let _ = out_tx_clone.send(WsOutMsg::Frame(Frame::close(conn_id).encode()));
     });
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = data_rx.recv().await {
             match msg {
                 ProxyMsg::Data(data) => {
+                    decrement_counter(&queued_to_upstream);
                     if tcp_tx.write_all(&data).await.is_err() {
                         break;
                     }

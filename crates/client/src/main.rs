@@ -1,7 +1,7 @@
 use clap::Parser;
 use expose_client::{
-    run_client_once_with_channel_config, CapacityConfig, DEFAULT_CONNECTION_CHANNEL_CAPACITY,
-    DEFAULT_WS_SEND_CHANNEL_CAPACITY,
+    run_client_once_with_channel_config, CapacityConfig,
+    DEFAULT_MAX_IN_FLIGHT_FRAMES_PER_CONNECTION,
 };
 use std::time::Duration;
 use tokio::time::sleep;
@@ -20,11 +20,8 @@ struct Args {
     #[arg(long)]
     upstream: String,
 
-    #[arg(long, default_value_t = DEFAULT_WS_SEND_CHANNEL_CAPACITY)]
-    ws_send_channel_capacity: usize,
-
-    #[arg(long, default_value_t = DEFAULT_CONNECTION_CHANNEL_CAPACITY)]
-    conn_write_channel_capacity: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_IN_FLIGHT_FRAMES_PER_CONNECTION)]
+    max_in_flight_frames_per_connection: usize,
 }
 
 #[tokio::main]
@@ -45,8 +42,7 @@ async fn main() {
             args.server.clone(),
             args.upstream.clone(),
             CapacityConfig {
-                ws_send_channel_capacity: args.ws_send_channel_capacity,
-                connection_channel_capacity: args.conn_write_channel_capacity,
+                max_in_flight_frames_per_connection: args.max_in_flight_frames_per_connection,
             },
         )
         .await;
