@@ -1,5 +1,12 @@
 use std::io;
 
+pub mod capacity;
+
+pub use capacity::{
+    acquire_permit, apply_flow_ack, semaphore_for_limit, CapacityConfig, ACK_BATCH_SIZE,
+    DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
+};
+
 // ── Frame types ──────────────────────────────────────────────────────────────
 
 /// Server → Client: a new TCP connection has been accepted.  Payload is empty.

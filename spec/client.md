@@ -6,8 +6,9 @@
 expose-client [OPTIONS]
 
 Options:
-  --server <URL>        Tunnel server WebSocket URL (e.g. ws://host:8080/secret or wss://host/secret) [required]
-  --upstream <ADDR>     Upstream TCP address to forward connections to (e.g. localhost:3000) [required]
+  --server <URL>                               Tunnel server WebSocket URL [required]
+  --upstream <ADDR>                            Upstream TCP address [required]
+  --max-pending-messages-per-connection <N>    Max DATA frames upstream→tunnel until server ACK [default: 256]
 ```
 
 ## Behavior

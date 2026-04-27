@@ -1,36 +1,23 @@
-use expose_common::{Frame, FRAME_ACK, FRAME_CLOSE, FRAME_DATA};
+pub use expose_common::{CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION};
+use expose_common::{
+    acquire_permit, apply_flow_ack, semaphore_for_limit, ACK_BATCH_SIZE, Frame, FRAME_ACK,
+    FRAME_CLOSE, FRAME_DATA,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, Mutex},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{error, info, warn};
-
-pub const DEFAULT_MAX_UNACKED_TO_TUNNEL_FRAMES_PER_CONNECTION: usize = 256;
-const ACK_BATCH_SIZE: u32 = 64;
-
-#[derive(Clone, Copy, Debug)]
-pub struct CapacityConfig {
-    pub max_unacked_to_tunnel_frames_per_connection: usize,
-}
-
-impl Default for CapacityConfig {
-    fn default() -> Self {
-        CapacityConfig {
-            max_unacked_to_tunnel_frames_per_connection:
-                DEFAULT_MAX_UNACKED_TO_TUNNEL_FRAMES_PER_CONNECTION,
-        }
-    }
-}
 
 struct AppState {
     tunnel_tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
@@ -42,60 +29,13 @@ struct AppState {
 struct ConnEntry {
     tx: mpsc::UnboundedSender<ProxyMsg>,
     remote_closed: bool,
-    unacked_to_tunnel: Option<Arc<Semaphore>>,
-    pending_to_tunnel: Arc<AtomicUsize>,
+    /// Visitor → tunnel: credits until the client ACKs after writing to upstream.
+    inflight_to_tunnel: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 enum ProxyMsg {
     Data(Vec<u8>),
     Close,
-}
-
-fn semaphore_for_limit(limit: usize) -> Option<Arc<Semaphore>> {
-    if limit == 0 {
-        None
-    } else {
-        Some(Arc::new(Semaphore::new(limit)))
-    }
-}
-
-async fn acquire_credit(limit: &Option<Arc<Semaphore>>) -> Option<OwnedSemaphorePermit> {
-    match limit {
-        Some(sem) => sem.clone().acquire_owned().await.ok(),
-        None => None,
-    }
-}
-
-fn release_acked_credits(pending: &AtomicUsize, sem: Option<&Semaphore>, ack_count: u32) {
-    if ack_count == 0 {
-        return;
-    }
-    let mut current = pending.load(Ordering::Acquire);
-    let mut released = 0usize;
-    let requested = ack_count as usize;
-    loop {
-        if current == 0 {
-            break;
-        }
-        let to_release = current.min(requested);
-        match pending.compare_exchange_weak(
-            current,
-            current - to_release,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                released = to_release;
-                break;
-            }
-            Err(next) => current = next,
-        }
-    }
-    if released > 0 {
-        if let Some(sem) = sem {
-            sem.add_permits(released);
-        }
-    }
 }
 
 impl AppState {
@@ -249,7 +189,12 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
                     return;
                 }
             };
-            release_connection_credits(state, frame.conn_id, ack_count).await;
+            let sem = {
+                let map = state.conn_map.lock().await;
+                map.get(&frame.conn_id)
+                    .and_then(|e| e.inflight_to_tunnel.clone())
+            };
+            apply_flow_ack(sem.as_deref(), ack_count);
         }
         FRAME_CLOSE => {
             let tx = {
@@ -285,17 +230,15 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     };
 
     let conn_id = state.next_conn_id();
-    let unacked_to_tunnel =
-        semaphore_for_limit(state.config.max_unacked_to_tunnel_frames_per_connection);
-    let pending_to_tunnel = Arc::new(AtomicUsize::new(0));
+    let inflight_to_tunnel =
+        semaphore_for_limit(state.config.max_pending_messages_per_connection);
     let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
     state.conn_map.lock().await.insert(
         conn_id,
         ConnEntry {
             tx: data_tx,
             remote_closed: false,
-            unacked_to_tunnel: unacked_to_tunnel.clone(),
-            pending_to_tunnel: Arc::clone(&pending_to_tunnel),
+            inflight_to_tunnel: inflight_to_tunnel.clone(),
         },
     );
 
@@ -312,20 +255,18 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
-            let permit = acquire_credit(&unacked_to_tunnel).await;
+            let permit = acquire_permit(&inflight_to_tunnel).await;
             match tcp_rx.read(&mut buf).await {
                 Ok(0) => {
                     drop(permit);
                     break;
                 }
                 Ok(n) => {
-                    if let Some(permit) = permit {
-                        permit.forget();
-                        pending_to_tunnel.fetch_add(1, Ordering::AcqRel);
+                    if let Some(p) = permit {
+                        p.forget();
                     }
                     let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
                     if tunnel_tx_clone.send(frame).is_err() {
-                        release_acked_credits(&pending_to_tunnel, unacked_to_tunnel.as_deref(), 1);
                         break;
                     }
                 }
@@ -367,23 +308,4 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
 
     state.conn_map.lock().await.remove(&conn_id);
     info!("Proxied connection {} closed", conn_id);
-}
-
-async fn release_connection_credits(state: &AppState, conn_id: u32, ack_count: u32) {
-    if ack_count == 0 {
-        return;
-    }
-
-    let (pending, sem) = {
-        let map = state.conn_map.lock().await;
-        match map.get(&conn_id) {
-            Some(entry) => (
-                Arc::clone(&entry.pending_to_tunnel),
-                entry.unacked_to_tunnel.clone(),
-            ),
-            None => return,
-        }
-    };
-
-    release_acked_credits(&pending, sem.as_deref(), ack_count);
 }

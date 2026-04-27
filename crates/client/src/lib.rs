@@ -1,33 +1,25 @@
-use expose_common::{Frame, FRAME_ACK, FRAME_CLOSE, FRAME_DATA, FRAME_OPEN};
+pub use expose_common::{
+    ACK_BATCH_SIZE, CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
+};
+use expose_common::{
+    acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, FRAME_ACK, FRAME_CLOSE,
+    FRAME_DATA, FRAME_OPEN,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, Mutex},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-pub const DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION: usize = 256;
-
-#[derive(Clone, Copy, Debug)]
-pub struct CapacityConfig {
-    pub max_pending_messages_per_connection: usize,
-}
-
-impl Default for CapacityConfig {
-    fn default() -> Self {
-        CapacityConfig {
-            max_pending_messages_per_connection: DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
-        }
-    }
-}
-
 struct ConnEntry {
     tx: mpsc::UnboundedSender<ProxyMsg>,
     remote_closed: bool,
-    inflight_to_server: Option<Arc<Semaphore>>,
+    /// Upstream → tunnel: credits until the server ACKs after writing to the visitor.
+    inflight_to_server: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
@@ -40,21 +32,6 @@ enum ProxyMsg {
 enum WsOutMsg {
     Frame(Vec<u8>),
     Data(Vec<u8>),
-}
-
-fn semaphore_for_limit(limit: usize) -> Option<Arc<Semaphore>> {
-    if limit == 0 {
-        None
-    } else {
-        Some(Arc::new(Semaphore::new(limit)))
-    }
-}
-
-async fn acquire_permit(limit: &Option<Arc<Semaphore>>) -> Option<OwnedSemaphorePermit> {
-    match limit {
-        Some(sem) => sem.clone().acquire_owned().await.ok(),
-        None => None,
-    }
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -197,19 +174,12 @@ async fn handle_frame(
                     return;
                 }
             };
-            if count == 0 {
-                return;
-            }
-
-            let map = conn_map.lock().await;
-            match map.get(&frame.conn_id) {
-                Some(entry) => entry
-                    .inflight_to_server
-                    .clone()
-                    .unwrap()
-                    .add_permits(count as usize),
-                None => return,
-            }
+            let sem = {
+                let map = conn_map.lock().await;
+                map.get(&frame.conn_id)
+                    .and_then(|e| e.inflight_to_server.clone())
+            };
+            apply_flow_ack(sem.as_deref(), count);
         }
 
         FRAME_DATA => {
@@ -323,7 +293,7 @@ async fn proxy_conn(
                         break;
                     }
                     write_ack_count = write_ack_count.saturating_add(1);
-                    if write_ack_count >= 64 {
+                    if write_ack_count >= ACK_BATCH_SIZE {
                         let _ = out_tx.send(WsOutMsg::Frame(
                             Frame::ack(conn_id, write_ack_count).encode(),
                         ));

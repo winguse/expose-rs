@@ -9,8 +9,7 @@ Options:
   --host <HOST>               Listen host [default: 0.0.0.0]
   --port <PORT>               Listen port [default: 8080]
   --secret-token <TOKEN>      Secret token path segment [required]
-  --max-inflight-to-tunnel-per-connection <N>    Max unacked DATA frames sent to client per connection [default: 256]
-  --max-inflight-from-tunnel-per-connection <N>  Max unacked DATA frames received from client per connection [default: 256]
+  --max-pending-messages-per-connection <N>      Max DATA frames proxied TCP→tunnel per connection until client ACK (written to upstream TCP) [default: 256]
 ```
 
 ## Behavior
@@ -39,10 +38,12 @@ For every non-tunnel TCP connection:
 
 ## Per-Connection Backpressure
 
-- The server enforces per-connection in-flight limits independently in each direction.
-- Sending side consumes one credit per `DATA` frame sent.
-- The credit is returned only when an `ACK(conn_id, count)` frame is received from the peer.
-- `ACK` is emitted by the receiving side after bytes are successfully written into the local TCP stream.
+Only one hop per direction applies the window:
+
+- **Visitor → tunnel → client → upstream**: The **server** limits how many `DATA` frames it reads from the proxied TCP and sends on the tunnel until the client sends `ACK` after writing to upstream TCP.
+- **Upstream → client → tunnel → visitor**: The **client** limits how many `DATA` frames it reads from upstream and sends until the server sends `ACK` after writing to the visitor TCP.
+
+Each `DATA` consumes one credit (`acquire` + `forget`); the peer returns exactly that many credits with `ACK(conn_id, count)` after successfully writing to its local TCP. The client and server each keep a pending window and `ACK_BATCH_SIZE` (64) as in `expose_common`.
 
 ## Error Handling
 
