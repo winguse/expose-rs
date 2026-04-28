@@ -54,8 +54,17 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-// Payload sizes to benchmark.
+// ── Payload helpers ───────────────────────────────────────────────────────────
+
+/// Payload sizes to benchmark.
 const PAYLOAD_SIZES: &[usize] = &[512, 1024, 16 * 1024, 64 * 1024, 1024 * 1024];
+
+/// Prime modulus used when generating payload bytes.
+///
+/// A prime that does not divide any common buffer size (512, 1024, 4096 …)
+/// ensures the repeating pattern never aligns with read/write boundaries,
+/// giving a more realistic byte stream.
+const PAYLOAD_MODULUS: u32 = 251;
 
 /// Returns a human-readable label for a byte count (e.g. "512B", "1KiB", "64KiB").
 fn size_label(bytes: usize) -> String {
@@ -66,6 +75,11 @@ fn size_label(bytes: usize) -> String {
     } else {
         format!("{}MiB", bytes / (1024 * 1024))
     }
+}
+
+/// Generates a deterministic payload of `size` bytes.
+fn make_payload(size: usize) -> Vec<u8> {
+    (0u32..).map(|i| (i % PAYLOAD_MODULUS) as u8).take(size).collect()
 }
 
 // ── Tunnel helpers ────────────────────────────────────────────────────────────
@@ -177,7 +191,7 @@ fn bench_single_connection_throughput(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
     for &size in PAYLOAD_SIZES {
-        let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(size).collect();
+        let payload = make_payload(size);
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(
@@ -233,7 +247,7 @@ fn bench_concurrent_connections_throughput(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
     const PAYLOAD_SIZE: usize = 64 * 1024;
-    let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(PAYLOAD_SIZE).collect();
+    let payload = make_payload(PAYLOAD_SIZE);
 
     for &num_conns in &[1usize, 4, 16] {
         // Criterion measures time per logical "iteration"; each iteration sends
@@ -306,7 +320,7 @@ fn bench_single_connection_throughput_direct(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
     for &size in PAYLOAD_SIZES {
-        let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(size).collect();
+        let payload = make_payload(size);
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(
@@ -348,7 +362,7 @@ fn bench_concurrent_connections_throughput_direct(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
     const PAYLOAD_SIZE: usize = 64 * 1024;
-    let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(PAYLOAD_SIZE).collect();
+    let payload = make_payload(PAYLOAD_SIZE);
 
     for &num_conns in &[1usize, 4, 16] {
         group.throughput(Throughput::Bytes((PAYLOAD_SIZE * num_conns) as u64));
