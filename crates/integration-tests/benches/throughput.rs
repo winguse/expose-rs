@@ -7,31 +7,38 @@
 //! Physical cores per socket : 2
 //! Siblings (HT threads) : 4
 //!
-//! # Measured throughput (optimized build, loopback, same machine)
+//! # Benchmark design
+//!
+//! Each benchmark keeps a **single persistent TCP connection** open across all
+//! iterations so that per-connection setup cost (WebSocket handshake, etc.) is
+//! not included in the throughput measurement.  Criterion is configured with a
+//! 5-second measurement window; it drives as many send-echo round-trips as
+//! possible and reports the average throughput (bytes/second) across that
+//! window.
+//!
+//! Payload sizes tested: 512 B, 1 KiB, 16 KiB, 64 KiB, 1 MiB.
 //!
 //! ## single_connection_throughput — via tunnel vs direct baseline
 //!
-//! | Payload size | Via tunnel (median) | Direct baseline (median) |
-//! |--------------|---------------------|--------------------------|
-//! | 16 KiB       | ~195 KiB/s          | ~113 MiB/s               |
-//! | 256 KiB      | ~6.0 MiB/s          | ~13 MiB/s                |
-//! | 1 MiB        | ~19 MiB/s           | ~27 MiB/s                |
+//! | Payload size | Via tunnel (avg/s) | Direct baseline (avg/s) |
+//! |--------------|--------------------|-------------------------|
+//! | 512 B        | TBD                | TBD                     |
+//! | 1 KiB        | TBD                | TBD                     |
+//! | 16 KiB       | TBD                | TBD                     |
+//! | 64 KiB       | TBD                | TBD                     |
+//! | 1 MiB        | TBD                | TBD                     |
 //!
 //! ## concurrent_connections_throughput — via tunnel vs direct baseline
 //! (64 KiB per connection, aggregate across all connections)
 //!
-//! | Connections | Via tunnel (median) | Direct baseline (median) |
-//! |-------------|---------------------|--------------------------|
-//! | 1           | ~1.5 MiB/s          | ~29 MiB/s                |
-//! | 4           | ~5.1 MiB/s          | ~46 MiB/s                |
-//! | 16          | ~21 MiB/s           | ~482 MiB/s               |
+//! | Connections | Via tunnel (avg/s) | Direct baseline (avg/s) |
+//! |-------------|--------------------|-------------------------|
+//! | 1           | TBD                | TBD                     |
+//! | 4           | TBD                | TBD                     |
+//! | 16          | TBD                | TBD                     |
 //!
 //! The "direct" benchmarks connect straight to the TCP echo server with no
-//! expose-rs server or client in the path, giving a loopback baseline.  The
-//! large gap at small payload sizes is dominated by the per-connection WebSocket
-//! handshake latency (~80 ms round-trip overhead per connection through the
-//! tunnel vs ~0.1-2 ms direct).  At larger payloads the gap narrows as
-//! serialisation / framing cost amortises over more bytes.
+//! expose-rs server or client in the path, giving a loopback baseline.
 //!
 //! Run with:
 //!   cargo bench -p expose-integration-tests
@@ -39,13 +46,27 @@
 //! The tunnel benchmarks spin up a full server + client over loopback and
 //! measure how many bytes per second flow through it.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+
+// Payload sizes to benchmark.
+const PAYLOAD_SIZES: &[usize] = &[512, 1024, 16 * 1024, 64 * 1024, 1024 * 1024];
+
+/// Returns a human-readable label for a byte count (e.g. "512B", "1KiB", "64KiB").
+fn size_label(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{}KiB", bytes / 1024)
+    } else {
+        format!("{}MiB", bytes / (1024 * 1024))
+    }
+}
 
 // ── Tunnel helpers ────────────────────────────────────────────────────────────
 
@@ -124,10 +145,21 @@ async fn start_tunnel(
     (server_addr, server_task, client_task)
 }
 
+// ── Shared benchmark configuration ────────────────────────────────────────────
+
+/// Measurement window for every benchmark group.
+const MEASUREMENT_SECS: u64 = 5;
+/// Warm-up window before each measurement.
+const WARMUP_SECS: u64 = 1;
+
 // ── Benchmarks ────────────────────────────────────────────────────────────────
 
-/// Single-connection throughput: send `payload_size` bytes through the tunnel,
-/// wait for the full echo, and report bytes/second.
+/// Single-connection throughput via the tunnel.
+///
+/// A persistent TCP connection is kept open across all Criterion iterations so
+/// that the WebSocket handshake cost is excluded from the measurement.  Criterion
+/// is told to measure for `MEASUREMENT_SECS` seconds; it runs as many
+/// send-echo round-trips as possible and derives average bytes/second.
 fn bench_single_connection_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -141,22 +173,30 @@ fn bench_single_connection_throughput(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("single_connection_throughput");
+    group.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
+    group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
-    for &size in &[16 * 1024usize, 256 * 1024, 1024 * 1024] {
+    for &size in PAYLOAD_SIZES {
         let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(size).collect();
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_bytes", size)),
+            BenchmarkId::from_parameter(size_label(size)),
             &payload,
             |b, payload| {
-                b.to_async(&rt).iter(|| async {
-                    let mut stream = TcpStream::connect(server_addr).await.unwrap();
-                    stream.write_all(payload).await.unwrap();
-
-                    let mut received = vec![0u8; payload.len()];
-                    stream.read_exact(&mut received).await.unwrap();
-                    received
+                let payload = payload.clone();
+                b.iter_custom(|iters| {
+                    let payload = payload.clone();
+                    rt.block_on(async move {
+                        let mut stream = TcpStream::connect(server_addr).await.unwrap();
+                        let mut buf = vec![0u8; payload.len()];
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            stream.write_all(&payload).await.unwrap();
+                            stream.read_exact(&mut buf).await.unwrap();
+                        }
+                        start.elapsed()
+                    })
                 });
             },
         );
@@ -171,8 +211,11 @@ fn bench_single_connection_throughput(c: &mut Criterion) {
     });
 }
 
-/// Concurrent-connection throughput: open `num_conns` connections in parallel,
-/// each sending `payload_size` bytes, and measure aggregate bytes/second.
+/// Concurrent-connection throughput via the tunnel.
+///
+/// Opens `num_conns` persistent connections in parallel, each repeatedly
+/// sending a 64 KiB chunk and reading the echo for `MEASUREMENT_SECS` seconds.
+/// The reported throughput is the aggregate across all connections.
 fn bench_concurrent_connections_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -186,34 +229,51 @@ fn bench_concurrent_connections_throughput(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("concurrent_connections_throughput");
+    group.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
+    group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
     const PAYLOAD_SIZE: usize = 64 * 1024;
     let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(PAYLOAD_SIZE).collect();
 
     for &num_conns in &[1usize, 4, 16] {
-        let total_bytes = (PAYLOAD_SIZE * num_conns) as u64;
-        group.throughput(Throughput::Bytes(total_bytes));
+        // Criterion measures time per logical "iteration"; each iteration sends
+        // one chunk on every connection, so throughput = num_conns * chunk_size.
+        group.throughput(Throughput::Bytes((PAYLOAD_SIZE * num_conns) as u64));
 
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}_conns", num_conns)),
             &(num_conns, payload.clone()),
             |b, (num_conns, payload)| {
                 let num_conns = *num_conns;
-                b.to_async(&rt).iter(|| async {
-                    let mut handles = Vec::with_capacity(num_conns);
-                    for _ in 0..num_conns {
-                        let p = payload.clone();
-                        handles.push(tokio::spawn(async move {
-                            let mut stream = TcpStream::connect(server_addr).await.unwrap();
-                            stream.write_all(&p).await.unwrap();
-                            let mut received = vec![0u8; p.len()];
-                            stream.read_exact(&mut received).await.unwrap();
-                            received
-                        }));
-                    }
-                    for h in handles {
-                        h.await.unwrap();
-                    }
+                let payload = payload.clone();
+                b.iter_custom(|iters| {
+                    let payload = payload.clone();
+                    rt.block_on(async move {
+                        // Open all connections before starting the clock.
+                        let mut streams = Vec::with_capacity(num_conns);
+                        for _ in 0..num_conns {
+                            streams.push(TcpStream::connect(server_addr).await.unwrap());
+                        }
+
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            let mut handles = Vec::with_capacity(num_conns);
+                            for stream in streams.drain(..) {
+                                let p = payload.clone();
+                                handles.push(tokio::spawn(async move {
+                                    let mut s = stream;
+                                    let mut buf = vec![0u8; p.len()];
+                                    s.write_all(&p).await.unwrap();
+                                    s.read_exact(&mut buf).await.unwrap();
+                                    s
+                                }));
+                            }
+                            for h in handles {
+                                streams.push(h.await.unwrap());
+                            }
+                        }
+                        start.elapsed()
+                    })
                 });
             },
         );
@@ -242,22 +302,30 @@ fn bench_single_connection_throughput_direct(c: &mut Criterion) {
     let echo_addr = rt.block_on(start_echo_server());
 
     let mut group = c.benchmark_group("single_connection_throughput_direct");
+    group.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
+    group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
-    for &size in &[16 * 1024usize, 256 * 1024, 1024 * 1024] {
+    for &size in PAYLOAD_SIZES {
         let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(size).collect();
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_bytes", size)),
+            BenchmarkId::from_parameter(size_label(size)),
             &payload,
             |b, payload| {
-                b.to_async(&rt).iter(|| async {
-                    let mut stream = TcpStream::connect(echo_addr).await.unwrap();
-                    stream.write_all(payload).await.unwrap();
-
-                    let mut received = vec![0u8; payload.len()];
-                    stream.read_exact(&mut received).await.unwrap();
-                    received
+                let payload = payload.clone();
+                b.iter_custom(|iters| {
+                    let payload = payload.clone();
+                    rt.block_on(async move {
+                        let mut stream = TcpStream::connect(echo_addr).await.unwrap();
+                        let mut buf = vec![0u8; payload.len()];
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            stream.write_all(&payload).await.unwrap();
+                            stream.read_exact(&mut buf).await.unwrap();
+                        }
+                        start.elapsed()
+                    })
                 });
             },
         );
@@ -276,34 +344,48 @@ fn bench_concurrent_connections_throughput_direct(c: &mut Criterion) {
     let echo_addr = rt.block_on(start_echo_server());
 
     let mut group = c.benchmark_group("concurrent_connections_throughput_direct");
+    group.measurement_time(Duration::from_secs(MEASUREMENT_SECS));
+    group.warm_up_time(Duration::from_secs(WARMUP_SECS));
 
     const PAYLOAD_SIZE: usize = 64 * 1024;
     let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(PAYLOAD_SIZE).collect();
 
     for &num_conns in &[1usize, 4, 16] {
-        let total_bytes = (PAYLOAD_SIZE * num_conns) as u64;
-        group.throughput(Throughput::Bytes(total_bytes));
+        group.throughput(Throughput::Bytes((PAYLOAD_SIZE * num_conns) as u64));
 
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}_conns", num_conns)),
             &(num_conns, payload.clone()),
             |b, (num_conns, payload)| {
                 let num_conns = *num_conns;
-                b.to_async(&rt).iter(|| async {
-                    let mut handles = Vec::with_capacity(num_conns);
-                    for _ in 0..num_conns {
-                        let p = payload.clone();
-                        handles.push(tokio::spawn(async move {
-                            let mut stream = TcpStream::connect(echo_addr).await.unwrap();
-                            stream.write_all(&p).await.unwrap();
-                            let mut received = vec![0u8; p.len()];
-                            stream.read_exact(&mut received).await.unwrap();
-                            received
-                        }));
-                    }
-                    for h in handles {
-                        h.await.unwrap();
-                    }
+                let payload = payload.clone();
+                b.iter_custom(|iters| {
+                    let payload = payload.clone();
+                    rt.block_on(async move {
+                        let mut streams = Vec::with_capacity(num_conns);
+                        for _ in 0..num_conns {
+                            streams.push(TcpStream::connect(echo_addr).await.unwrap());
+                        }
+
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            let mut handles = Vec::with_capacity(num_conns);
+                            for stream in streams.drain(..) {
+                                let p = payload.clone();
+                                handles.push(tokio::spawn(async move {
+                                    let mut s = stream;
+                                    let mut buf = vec![0u8; p.len()];
+                                    s.write_all(&p).await.unwrap();
+                                    s.read_exact(&mut buf).await.unwrap();
+                                    s
+                                }));
+                            }
+                            for h in handles {
+                                streams.push(h.await.unwrap());
+                            }
+                        }
+                        start.elapsed()
+                    })
                 });
             },
         );
