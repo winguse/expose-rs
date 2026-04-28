@@ -174,7 +174,8 @@ async fn test_large_data() {
 
     wait_until_tunnel_ready(server_addr).await;
 
-    // 512 KiB of data.
+    // 512 KiB of data.  251 is prime, so the byte pattern does not repeat on
+    // power-of-two boundaries — useful for catching alignment-related bugs.
     let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(512 * 1024).collect();
 
     let mut stream = TcpStream::connect(server_addr).await.unwrap();
@@ -348,14 +349,16 @@ async fn test_tunnel_reconnect_cleanup_race() {
         upstream.to_string(),
         expose_client::CapacityConfig::default(),
     ));
-    // Give B time to complete the WebSocket handshake with the server.
+    // Give B time to complete the WebSocket handshake with the server before
+    // we abort A.  150 ms is ample for a loopback WS handshake.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Phase 3: Abort A's task.  This drops A's WebSocket, causing the server's
     // handle_tunnel for A to see a WS error and run its cleanup code.
     client_a_task.abort();
 
-    // Phase 4: Give the server time to process A's disconnect and run cleanup.
+    // Phase 4: Give the server time to detect A's disconnect and execute cleanup.
+    // 300 ms covers the WS error propagation + task scheduling latency.
     // If the bug is present the cleanup sets tunnel_tx = None, breaking B's tunnel.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -464,6 +467,7 @@ async fn test_flow_control_small_limit() {
     wait_until_tunnel_ready(server_addr).await;
 
     // 256 KiB — enough to exercise many flow-control cycles with this window.
+    // 251 is prime so the byte pattern does not repeat on power-of-two boundaries.
     let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(256 * 1024).collect();
 
     let mut stream = TcpStream::connect(server_addr).await.unwrap();

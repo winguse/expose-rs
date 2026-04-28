@@ -142,9 +142,15 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     // Register this tunnel and record our session ID.
     // Incrementing the session counter atomically (under the lock) lets cleanup
     // distinguish itself from a newer tunnel that may have registered in the meantime.
+    //
+    // The counter is u64 and increments once per tunnel connection.  Overflow would
+    // require ~1.8 × 10¹⁹ reconnections — practically impossible — but note that if
+    // it ever did wrap around exactly to a previous value the stale-cleanup guard
+    // would fail to protect that specific session.  The wrapping_add is intentional
+    // to avoid a panic in debug builds.
     let my_session = {
         let mut guard = state.tunnel.lock().await;
-        guard.session += 1;
+        guard.session = guard.session.wrapping_add(1);
         let session = guard.session;
         guard.tx = Some(tunnel_tx);
         session
