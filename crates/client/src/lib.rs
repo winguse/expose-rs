@@ -30,8 +30,6 @@ type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
 enum ProxyMsg {
     Data(Vec<u8>),
     Close,
-    /// The remote peer reported a TCP write error; stop the writer task.
-    WriteError,
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -235,13 +233,11 @@ async fn handle_frame(
         FRAME_WRITE_ERROR => {
             // The server could not write to the visitor.
             // * Signal our local reader to stop gracefully (via watch channel).
-            // * Signal our local writer to stop (via ProxyMsg::WriteError).
             // * Do NOT remove conn_id from conn_map here; cleanup happens after
             //   both tasks finish in proxy_conn.
             let map = conn_map.lock().await;
             if let Some(entry) = map.get(&frame.conn_id) {
                 let _ = entry.peer_write_error.send(true);
-                let _ = entry.tx.send(ProxyMsg::WriteError);
             }
         }
 
@@ -352,7 +348,6 @@ async fn proxy_conn(
                     }
                 }
                 ProxyMsg::Close => break,
-                ProxyMsg::WriteError => break,
             }
         }
         if write_ack_count > 0 {
@@ -366,4 +361,3 @@ async fn proxy_conn(
     conn_map.lock().await.remove(&conn_id);
     info!("Upstream connection for conn {} closed", conn_id);
 }
-

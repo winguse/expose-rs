@@ -52,8 +52,6 @@ struct ConnEntry {
 enum ProxyMsg {
     Data(Vec<u8>),
     Close,
-    /// The remote peer reported a TCP write error; stop the writer task.
-    WriteError,
 }
 
 impl AppState {
@@ -259,13 +257,11 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
         FRAME_WRITE_ERROR => {
             // The client could not write to upstream.
             // * Signal our local reader to stop gracefully (via watch channel).
-            // * Signal our local writer to stop (via ProxyMsg::WriteError).
             // * Do NOT remove conn_id from conn_map here; cleanup happens after
             //   both tasks finish in handle_proxy.
             let map = state.conn_map.lock().await;
             if let Some(entry) = map.get(&frame.conn_id) {
                 let _ = entry.peer_write_error.send(true);
-                let _ = entry.tx.send(ProxyMsg::WriteError);
             }
         }
         other => {
@@ -378,7 +374,10 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
             match msg {
                 ProxyMsg::Data(payload) => {
                     if let Err(e) = tcp_tx.write_all(&payload).await {
-                        error!("TCP write error for conn {}: {}; notifying client", conn_id, e);
+                        error!(
+                            "TCP write error for conn {}: {}; notifying client",
+                            conn_id, e
+                        );
                         // Signal the peer with FRAME_WRITE_ERROR.  We intentionally
                         // do NOT abort the reader or remove conn_id from conn_map
                         // here — the reader keeps running and conn_map is cleaned up
@@ -393,7 +392,6 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                     }
                 }
                 ProxyMsg::Close => break,
-                ProxyMsg::WriteError => break,
             }
         }
         if ack_batch > 0 {
