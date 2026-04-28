@@ -12,7 +12,7 @@ use tokio::{
     net::TcpStream,
     sync::{mpsc, watch, Mutex},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 struct ConnEntry {
@@ -49,33 +49,66 @@ pub async fn run_client_once_with_channel_config(
     upstream: String,
     channel_config: CapacityConfig,
 ) {
-    match connect_async(&server_url).await {
+    // Parse host:port from the WebSocket URL (ws://host:port/path) so we can
+    // create the TCP connection ourselves, allowing TCP_NODELAY to be set
+    // before the WebSocket handshake.
+    let host_port = server_url
+        .strip_prefix("wss://")
+        .or_else(|| server_url.strip_prefix("ws://"))
+        .map(|s| {
+            let end = s.find('/').unwrap_or(s.len());
+            &s[..end]
+        })
+        .unwrap_or(&server_url);
+
+    let tcp = match TcpStream::connect(host_port).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to connect to {}: {}", server_url, e);
+            return;
+        }
+    };
+    tcp.set_nodelay(true).ok();
+
+    match tokio_tungstenite::client_async(&server_url, tcp).await {
         Ok((ws, _)) => {
             info!("Connected to server at {}", server_url);
             run_client(ws, upstream, channel_config).await;
         }
         Err(e) => {
-            error!("Failed to connect to {}: {}", server_url, e);
+            error!("WebSocket handshake failed for {}: {}", server_url, e);
         }
     }
 }
 
 // ── Internal loop ─────────────────────────────────────────────────────────────
 
-async fn run_client(
-    ws: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+async fn run_client<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
     upstream: String,
     channel_config: CapacityConfig,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut ws_tx, mut ws_rx) = ws.split();
     // Single outgoing channel for all frames (ACKs, CLOSE, DATA).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = out_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+        'outer: loop {
+            let bytes = match out_rx.recv().await {
+                Some(b) => b,
+                None => break,
+            };
+            if ws_tx.feed(Message::Binary(bytes)).await.is_err() {
+                break;
+            }
+            while let Ok(more) = out_rx.try_recv() {
+                if ws_tx.feed(Message::Binary(more)).await.is_err() {
+                    break 'outer;
+                }
+            }
+            if ws_tx.flush().await.is_err() {
                 break;
             }
         }
@@ -144,6 +177,7 @@ async fn handle_frame(
                 match TcpStream::connect(&upstream).await {
                     Ok(stream) => {
                         info!("Opened upstream connection for conn {}", conn_id);
+                        stream.set_nodelay(true).ok();
                         if !conn_map_clone.lock().await.contains_key(&conn_id) {
                             return;
                         }
@@ -267,7 +301,7 @@ async fn proxy_conn(
 
     let reader = tokio::spawn(async move {
         let mut peer_write_error_rx = peer_write_error_rx;
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; 64 * 1024];
         let mut stopped_by_peer_error = false;
         'reader: loop {
             // Wait for a flow-control permit, but also watch for a peer write

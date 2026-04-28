@@ -129,6 +129,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>, tunnel_prefi
 async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     info!("Tunnel client connecting via WebSocket handshake");
 
+    stream.set_nodelay(true).ok();
     let ws = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -162,8 +163,20 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     state.conn_map.lock().await.clear();
 
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = tunnel_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+        'outer: loop {
+            let bytes = match tunnel_rx.recv().await {
+                Some(b) => b,
+                None => break,
+            };
+            if ws_tx.feed(Message::Binary(bytes)).await.is_err() {
+                break;
+            }
+            while let Ok(more) = tunnel_rx.try_recv() {
+                if ws_tx.feed(Message::Binary(more)).await.is_err() {
+                    break 'outer;
+                }
+            }
+            if ws_tx.flush().await.is_err() {
                 break;
             }
         }
@@ -271,6 +284,7 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
 }
 
 async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
+    stream.set_nodelay(true).ok();
     let tunnel_tx = {
         let guard = state.tunnel.lock().await;
         match guard.tx.as_ref() {
@@ -309,7 +323,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
 
     let reader = tokio::spawn(async move {
         let mut peer_write_error_rx = peer_write_error_rx;
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; 64 * 1024];
         let mut stopped_by_peer_error = false;
         'reader: loop {
             // Wait for a flow-control permit, but also watch for a peer write
