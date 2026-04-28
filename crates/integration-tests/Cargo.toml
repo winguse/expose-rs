@@ -9,3 +9,8 @@ expose-server = { path = "../server" }
 expose-client = { path = "../client" }
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.5"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "throughput"
+harness = false

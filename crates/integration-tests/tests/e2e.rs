@@ -791,3 +791,222 @@ async fn test_server_write_error_propagated_to_client() {
     server_task.abort();
     client_task.abort();
 }
+
+// ── Multiplexing proxy tests ──────────────────────────────────────────────────
+
+/// Data isolation across multiplexed connections.
+///
+/// Opens many concurrent connections through the same tunnel and sends each
+/// connection a unique byte pattern.  After collecting all echoes, verifies
+/// that every connection received exactly its own data — i.e. the multiplexer
+/// never routes a frame to the wrong connection.
+#[tokio::test]
+async fn test_multiplexing_data_isolation() {
+    let upstream = start_echo_server().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+    wait_until_tunnel_ready(server_addr).await;
+
+    // 50 connections, each tagged with a unique fill byte.
+    const N: usize = 50;
+    const PAYLOAD_SIZE: usize = 4 * 1024;
+
+    let mut handles = Vec::with_capacity(N);
+    for conn in 0..N {
+        let fill = conn as u8;
+        handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(server_addr).await.unwrap();
+            let payload = vec![fill; PAYLOAD_SIZE];
+            stream.write_all(&payload).await.unwrap();
+
+            let mut received = vec![0u8; PAYLOAD_SIZE];
+            timeout(Duration::from_secs(15), stream.read_exact(&mut received))
+                .await
+                .unwrap_or_else(|_| panic!("conn {conn}: read timed out"))
+                .unwrap_or_else(|e| panic!("conn {conn}: read error: {e}"));
+
+            // Every byte must equal the fill value for this connection.
+            assert!(
+                received.iter().all(|&b| b == fill),
+                "conn {conn}: received data contains bytes not equal to fill byte {fill:#04x}"
+            );
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("data-isolation task panicked");
+    }
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// Rapid connection cycling while long-lived connections remain active.
+///
+/// A set of "anchor" connections stay open throughout the test, streaming data
+/// continuously.  A separate burst of short-lived connections opens and closes
+/// quickly in the foreground.  After all short-lived connections are done the
+/// anchor connections must still receive correct data — rapid cycling of
+/// connection IDs must not disturb established connections.
+#[tokio::test]
+async fn test_multiplexing_rapid_cycling() {
+    let upstream = start_echo_server().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+    wait_until_tunnel_ready(server_addr).await;
+
+    // Open a few long-lived anchor connections that stream data throughout.
+    const NUM_ANCHORS: usize = 4;
+    const ANCHOR_PAYLOAD_SIZE: usize = 32 * 1024;
+    let mut anchor_handles = Vec::with_capacity(NUM_ANCHORS);
+    for anchor in 0..NUM_ANCHORS {
+        let fill = (anchor as u8).wrapping_add(0xA0);
+        anchor_handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(server_addr).await.unwrap();
+            let payload = vec![fill; ANCHOR_PAYLOAD_SIZE];
+            stream.write_all(&payload).await.unwrap();
+
+            let mut received = vec![0u8; ANCHOR_PAYLOAD_SIZE];
+            timeout(Duration::from_secs(30), stream.read_exact(&mut received))
+                .await
+                .unwrap_or_else(|_| panic!("anchor {anchor}: read timed out"))
+                .unwrap_or_else(|e| panic!("anchor {anchor}: read error: {e}"));
+
+            assert!(
+                received.iter().all(|&b| b == fill),
+                "anchor {anchor}: data corrupted after rapid cycling"
+            );
+        }));
+    }
+
+    // Rapidly open and close 100 short-lived connections while anchors are in flight.
+    const NUM_SHORT: usize = 100;
+    let mut short_handles = Vec::with_capacity(NUM_SHORT);
+    for i in 0..NUM_SHORT {
+        short_handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(server_addr).await.unwrap();
+            let payload = format!("short-{i}");
+            stream.write_all(payload.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            // Drain the echo.
+            let mut buf = vec![0u8; payload.len()];
+            timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("short-conn {i}: read timed out"))
+                .unwrap_or_else(|e| panic!("short-conn {i}: read error: {e}"));
+            assert_eq!(buf, payload.as_bytes(), "short-conn {i}: echo mismatch");
+        }));
+    }
+
+    for h in short_handles {
+        h.await.expect("short-lived connection task panicked");
+    }
+    for h in anchor_handles {
+        h.await.expect("anchor connection task panicked");
+    }
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// Connection failure isolation.
+///
+/// One connection is routed to an upstream that immediately drops the TCP
+/// connection, while many other connections are routed to a normal echo server
+/// through the same tunnel.  The failing connection must be cleaned up without
+/// disrupting the concurrently active connections.
+#[tokio::test]
+async fn test_multiplexing_independent_failure() {
+    // Good upstream: echo server.
+    let good_upstream = start_echo_server().await;
+
+    // Bad upstream: bind a port then immediately close the listener so any
+    // connection to it is refused instantly.
+    let dummy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bad_addr = dummy.local_addr().unwrap();
+    drop(dummy);
+
+    // We need two separate tunnels because each tunnel is locked to one upstream.
+    // Tunnel A → good upstream (carries the healthy connections).
+    let secret_a = "mux-fail-good".to_string();
+    let server_listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr_a = server_listener_a.local_addr().unwrap();
+    let server_task_a = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener_a,
+        secret_a.clone(),
+        expose_server::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let client_task_a = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        format!("ws://{}/{}", server_addr_a, secret_a),
+        good_upstream.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
+    wait_until_tunnel_ready(server_addr_a).await;
+
+    // Tunnel B → bad upstream (carries the failing connections).
+    let secret_b = "mux-fail-bad".to_string();
+    let server_listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr_b = server_listener_b.local_addr().unwrap();
+    let server_task_b = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener_b,
+        secret_b.clone(),
+        expose_server::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let client_task_b = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        format!("ws://{}/{}", server_addr_b, secret_b),
+        bad_addr.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Spawn several healthy connections through tunnel A.
+    const NUM_HEALTHY: usize = 10;
+    let mut healthy_handles = Vec::with_capacity(NUM_HEALTHY);
+    for i in 0..NUM_HEALTHY {
+        healthy_handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(server_addr_a).await.unwrap();
+            let payload = format!("healthy-{i}");
+            stream.write_all(payload.as_bytes()).await.unwrap();
+
+            let mut buf = vec![0u8; payload.len()];
+            timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("healthy conn {i}: read timed out"))
+                .unwrap_or_else(|e| panic!("healthy conn {i}: read error: {e}"));
+            assert_eq!(buf, payload.as_bytes(), "healthy conn {i}: echo mismatch");
+        }));
+    }
+
+    // Simultaneously fire failing connections through tunnel B.
+    const NUM_FAILING: usize = 10;
+    let mut failing_handles = Vec::with_capacity(NUM_FAILING);
+    for i in 0..NUM_FAILING {
+        failing_handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(server_addr_b).await.unwrap();
+            // Send a byte so the server's peek() classifies this as a proxy connection.
+            stream.write_all(b"x").await.unwrap();
+            // Expect a clean EOF: the client sends CLOSE when upstream is refused.
+            let mut buf = [0u8; 1];
+            let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("failing conn {i}: close timed out"))
+                .unwrap_or_else(|e| panic!("failing conn {i}: read error: {e}"));
+            assert_eq!(n, 0, "failing conn {i}: expected EOF, got data");
+        }));
+    }
+
+    // Both sets must complete: failing connections get a clean EOF, healthy ones
+    // get their echo.  If a failure in one tunnel leaked into the other this
+    // would hang or produce wrong data.
+    for h in failing_handles {
+        h.await.expect("failing connection task panicked");
+    }
+    for h in healthy_handles {
+        h.await.expect("healthy connection task panicked");
+    }
+
+    server_task_a.abort();
+    client_task_a.abort();
+    server_task_b.abort();
+    client_task_b.abort();
+}
