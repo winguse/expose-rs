@@ -484,3 +484,104 @@ async fn test_flow_control_small_limit() {
     server_task.abort();
     client_task.abort();
 }
+
+// ── Write-error propagation ───────────────────────────────────────────────────
+
+/// When the upstream connection is forcefully reset while data is in flight,
+/// the client writer detects the write error, sends FRAME_WRITE_ERROR to the
+/// server, and the server closes the visitor's connection cleanly.
+///
+/// Scenario: upstream accepts, reads one byte, then immediately drops the
+/// connection (RST).  The server sends enough data to trigger a write error on
+/// the client side.  The server must receive FRAME_WRITE_ERROR and close the
+/// visitor connection rather than hanging.
+#[tokio::test]
+async fn test_client_write_error_propagated_to_server() {
+    // Upstream that accepts, reads one byte, then RSTs.
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = upstream_listener.accept().await {
+            let (mut rx, _tx) = stream.into_split();
+            let mut buf = [0u8; 1];
+            let _ = rx.read(&mut buf).await;
+            // stream (and _tx) dropped here → RST / FIN to client side
+        }
+    });
+
+    let secret = "write-err-client".to_string();
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener,
+        secret.clone(),
+        expose_server::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let ws_url = format!("ws://{}/{}", server_addr, secret);
+    let client_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url,
+        upstream_addr.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect visitor.  Send some data; upstream drops the connection after one
+    // byte which will cause write errors on the client side.
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    // Send enough to flow through the tunnel so the upstream write error can fire.
+    stream.write_all(&vec![0u8; 64]).await.unwrap();
+
+    // The visitor's connection must be closed (EOF) within 3 s — the server
+    // receives FRAME_WRITE_ERROR and shuts down the visitor socket.
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .expect("timed out: server did not close visitor conn after upstream write error")
+        .expect("read error");
+    assert_eq!(
+        n, 0,
+        "visitor connection must be closed after upstream write error"
+    );
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// When the visitor resets its TCP connection while the server is writing data
+/// to it, the server writer detects the write error, sends FRAME_WRITE_ERROR to
+/// the client, and the client stops forwarding data from upstream.
+///
+/// After the error the tunnel itself must remain operational for new connections.
+#[tokio::test]
+async fn test_server_write_error_propagated_to_client() {
+    let upstream = start_echo_server().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+    wait_until_tunnel_ready(server_addr).await;
+
+    // Connect a visitor that will RST immediately after sending data.
+    let std_stream = std::net::TcpStream::connect(server_addr).unwrap();
+    // SO_LINGER = 0 → RST instead of FIN on close.
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let sock = unsafe { socket2::Socket::from_raw_fd(std_stream.as_raw_fd()) };
+        sock.set_linger(Some(Duration::ZERO)).unwrap();
+        std::mem::forget(sock); // don't close the fd twice
+    }
+    std_stream.set_nonblocking(true).unwrap();
+    let mut visitor = TcpStream::from_std(std_stream).unwrap();
+    // Send data so the echo path is active, then RST.
+    visitor.write_all(&vec![0u8; 4096]).await.unwrap();
+    drop(visitor); // RST
+
+    // Give the error time to propagate through the tunnel.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Tunnel must still be operational — FRAME_WRITE_ERROR must not have broken
+    // the WebSocket or left the server in an inconsistent state.
+    wait_until_tunnel_ready(server_addr).await;
+
+    server_task.abort();
+    client_task.abort();
+}

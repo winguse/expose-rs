@@ -17,6 +17,10 @@ pub const FRAME_DATA: u8 = 0x02;
 pub const FRAME_CLOSE: u8 = 0x03;
 /// Bidirectional: peer acknowledged written DATA frames. Payload is u32 count.
 pub const FRAME_ACK: u8 = 0x04;
+/// Bidirectional: TCP write on the sending side failed (e.g. broken pipe, connection
+/// reset).  The receiver must stop sending DATA for this connection and treat it as
+/// fully closed.  Distinct from FRAME_CLOSE (which signals a clean EOF / half-close).
+pub const FRAME_WRITE_ERROR: u8 = 0x05;
 
 // ── Wire layout ──────────────────────────────────────────────────────────────
 //
@@ -58,6 +62,14 @@ impl Frame {
         Frame {
             conn_id,
             frame_type: FRAME_CLOSE,
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn write_error(conn_id: u32) -> Self {
+        Frame {
+            conn_id,
+            frame_type: FRAME_WRITE_ERROR,
             payload: Vec::new(),
         }
     }

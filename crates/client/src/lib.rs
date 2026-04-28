@@ -1,6 +1,6 @@
 use expose_common::{
     acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, FRAME_ACK, FRAME_CLOSE, FRAME_DATA,
-    FRAME_OPEN,
+    FRAME_OPEN, FRAME_WRITE_ERROR,
 };
 pub use expose_common::{
     CapacityConfig, ACK_BATCH_SIZE, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
@@ -20,6 +20,8 @@ struct ConnEntry {
     remote_closed: bool,
     /// Upstream → tunnel: credits until the server ACKs after writing to the visitor.
     inflight_to_server: Option<Arc<tokio::sync::Semaphore>>,
+    /// Abort handle for the reader task; set by proxy_conn after spawning.
+    reader_abort: Option<tokio::task::AbortHandle>,
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
@@ -27,6 +29,8 @@ type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
 enum ProxyMsg {
     Data(Vec<u8>),
     Close,
+    /// The remote peer reported a TCP write error; stop immediately.
+    WriteError,
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -132,6 +136,8 @@ async fn handle_frame(
                     remote_closed: false,
                     // Clone the Arc so we can also pass it to proxy_conn below.
                     inflight_to_server: inflight_to_server.clone(),
+                    // Filled in by proxy_conn after the reader task is spawned.
+                    reader_abort: None,
                 },
             );
 
@@ -226,6 +232,19 @@ async fn handle_frame(
             }
         }
 
+        FRAME_WRITE_ERROR => {
+            // The server could not write to the visitor.  Abort the reader (which
+            // would otherwise keep forwarding upstream bytes to the server) and
+            // signal the writer to stop as well.
+            let entry = conn_map.lock().await.remove(&frame.conn_id);
+            if let Some(entry) = entry {
+                if let Some(abort) = entry.reader_abort {
+                    abort.abort();
+                }
+                let _ = entry.tx.send(ProxyMsg::WriteError);
+            }
+        }
+
         other => {
             warn!("Unexpected frame type {:#04x} from server", other);
         }
@@ -280,14 +299,28 @@ async fn proxy_conn(
         let _ = out_tx_clone.send(Frame::close(conn_id).encode());
     });
 
+    // Store the reader's abort handle so handle_frame can cancel it on WRITE_ERROR.
+    let reader_abort = reader.abort_handle();
+    {
+        let mut map = conn_map.lock().await;
+        if let Some(entry) = map.get_mut(&conn_id) {
+            entry.reader_abort = Some(reader_abort.clone());
+        }
+    }
+
+    let conn_map_writer = Arc::clone(&conn_map);
     let writer = tokio::spawn(async move {
         while let Some(msg) = data_rx.recv().await {
             match msg {
                 ProxyMsg::Data(payload) => {
                     if let Err(e) = tcp_tx.write_all(&payload).await {
                         error!("Upstream write error for conn {}: {}; notifying server", conn_id, e);
-                        // Tell the server to stop sending DATA for this connection.
-                        let _ = out_tx.send(Frame::close(conn_id).encode());
+                        // Abort the reader so it stops forwarding upstream bytes to the server.
+                        reader_abort.abort();
+                        // Remove from conn_map so no further DATA frames are routed here.
+                        conn_map_writer.lock().await.remove(&conn_id);
+                        // Tell the server this connection has a write error (not a clean close).
+                        let _ = out_tx.send(Frame::write_error(conn_id).encode());
                         break;
                     }
                     write_ack_count = write_ack_count.saturating_add(1);
@@ -297,6 +330,10 @@ async fn proxy_conn(
                     }
                 }
                 ProxyMsg::Close => break,
+                ProxyMsg::WriteError => {
+                    // Remote server reported a write error; stop immediately.
+                    break;
+                }
             }
         }
         if write_ack_count > 0 {

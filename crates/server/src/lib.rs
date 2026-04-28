@@ -1,6 +1,6 @@
 use expose_common::{
     acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, ACK_BATCH_SIZE, FRAME_ACK,
-    FRAME_CLOSE, FRAME_DATA,
+    FRAME_CLOSE, FRAME_DATA, FRAME_WRITE_ERROR,
 };
 pub use expose_common::{CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION};
 use futures_util::{SinkExt, StreamExt};
@@ -44,11 +44,15 @@ struct ConnEntry {
     remote_closed: bool,
     /// Visitor → tunnel: credits until the client ACKs after writing to upstream.
     inflight_to_tunnel: Option<Arc<tokio::sync::Semaphore>>,
+    /// Abort handle for the reader task; set after the reader is spawned.
+    reader_abort: Option<tokio::task::AbortHandle>,
 }
 
 enum ProxyMsg {
     Data(Vec<u8>),
     Close,
+    /// The remote peer reported a TCP write error; stop immediately.
+    WriteError,
 }
 
 impl AppState {
@@ -251,6 +255,18 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
                 let _ = tx.send(ProxyMsg::Close);
             }
         }
+        FRAME_WRITE_ERROR => {
+            // The client could not write to upstream.  Stop the reader (which
+            // would otherwise keep forwarding visitor bytes to the client) and
+            // signal the writer to stop as well, then close the visitor connection.
+            let entry = state.conn_map.lock().await.remove(&frame.conn_id);
+            if let Some(entry) = entry {
+                if let Some(abort) = entry.reader_abort {
+                    abort.abort();
+                }
+                let _ = entry.tx.send(ProxyMsg::WriteError);
+            }
+        }
         other => {
             warn!("Unexpected frame type {:#04x} from tunnel", other);
         }
@@ -272,12 +288,15 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let conn_id = state.next_conn_id();
     let inflight_to_tunnel = semaphore_for_limit(state.config.max_pending_messages_per_connection);
     let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
+
+    // Insert with reader_abort = None; we fill it in after spawning the reader below.
     state.conn_map.lock().await.insert(
         conn_id,
         ConnEntry {
             tx: data_tx,
             remote_closed: false,
             inflight_to_tunnel: inflight_to_tunnel.clone(),
+            reader_abort: None,
         },
     );
 
@@ -322,6 +341,16 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode());
     });
 
+    // Store the reader's abort handle so dispatch_from_tunnel can cancel it on WRITE_ERROR.
+    let reader_abort = reader.abort_handle();
+    {
+        let mut map = state.conn_map.lock().await;
+        if let Some(entry) = map.get_mut(&conn_id) {
+            entry.reader_abort = Some(reader_abort.clone());
+        }
+    }
+
+    let state_clone = Arc::clone(&state);
     let writer = tokio::spawn(async move {
         let mut rx = data_rx;
         let mut ack_batch: u32 = 0;
@@ -330,8 +359,12 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                 ProxyMsg::Data(payload) => {
                     if let Err(e) = tcp_tx.write_all(&payload).await {
                         error!("TCP write error for conn {}: {}; notifying client", conn_id, e);
-                        // Tell the client to stop sending DATA for this connection.
-                        let _ = tunnel_tx.send(Frame::close(conn_id).encode());
+                        // Abort the reader so it stops forwarding visitor bytes to the client.
+                        reader_abort.abort();
+                        // Remove from conn_map so no further DATA frames are routed here.
+                        state_clone.conn_map.lock().await.remove(&conn_id);
+                        // Tell the client this connection has a write error (not a clean close).
+                        let _ = tunnel_tx.send(Frame::write_error(conn_id).encode());
                         break;
                     }
                     ack_batch = ack_batch.saturating_add(1);
@@ -341,6 +374,10 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                     }
                 }
                 ProxyMsg::Close => break,
+                ProxyMsg::WriteError => {
+                    // Remote client reported a write error; stop immediately.
+                    break;
+                }
             }
         }
         if ack_batch > 0 {
