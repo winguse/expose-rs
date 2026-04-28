@@ -19,8 +19,21 @@ use tokio::{
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
+// ── Tunnel state ─────────────────────────────────────────────────────────────
+
+/// Holds the active tunnel sender together with a monotone session counter.
+///
+/// The session counter is incremented each time a new tunnel WebSocket connects.
+/// Cleanup code checks that the session hasn't advanced before clearing the
+/// sender, preventing a race where stale cleanup from an old tunnel clobbers
+/// the newly-registered sender of a replacement tunnel.
+struct TunnelState {
+    session: u64,
+    tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+}
+
 struct AppState {
-    tunnel_tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    tunnel: Mutex<TunnelState>,
     conn_map: Mutex<HashMap<u32, ConnEntry>>,
     next_id: AtomicU32,
     config: CapacityConfig,
@@ -41,7 +54,10 @@ enum ProxyMsg {
 impl AppState {
     fn new(config: CapacityConfig) -> Self {
         AppState {
-            tunnel_tx: Mutex::new(None),
+            tunnel: Mutex::new(TunnelState {
+                session: 0,
+                tx: None,
+            }),
             conn_map: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             config,
@@ -123,11 +139,18 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    {
-        let mut guard = state.tunnel_tx.lock().await;
-        *guard = Some(tunnel_tx);
-        state.conn_map.lock().await.clear();
-    }
+    // Register this tunnel and record our session ID.
+    // Incrementing the session counter atomically (under the lock) lets cleanup
+    // distinguish itself from a newer tunnel that may have registered in the meantime.
+    let my_session = {
+        let mut guard = state.tunnel.lock().await;
+        guard.session += 1;
+        let session = guard.session;
+        guard.tx = Some(tunnel_tx);
+        session
+        // guard is dropped here — conn_map is cleared without holding the tunnel lock
+    };
+    state.conn_map.lock().await.clear();
 
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = tunnel_rx.recv().await {
@@ -155,9 +178,20 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
 
     info!("Tunnel client disconnected");
 
-    {
-        let mut guard = state.tunnel_tx.lock().await;
-        *guard = None;
+    // Only clear tunnel state if no newer tunnel has registered since us.
+    // Without this check a stale cleanup from an old tunnel would set
+    // tunnel_tx = None after a replacement tunnel has already written its sender
+    // into the slot, permanently breaking the new tunnel.
+    let was_active = {
+        let mut guard = state.tunnel.lock().await;
+        if guard.session == my_session {
+            guard.tx = None;
+            true
+        } else {
+            false
+        }
+    };
+    if was_active {
         state.conn_map.lock().await.clear();
     }
 
@@ -219,8 +253,8 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
 
 async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let tunnel_tx = {
-        let guard = state.tunnel_tx.lock().await;
-        match guard.as_ref() {
+        let guard = state.tunnel.lock().await;
+        match guard.tx.as_ref() {
             Some(tx) => tx.clone(),
             None => {
                 warn!("No tunnel client connected; dropping incoming connection");
@@ -261,12 +295,15 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                     break;
                 }
                 Ok(n) => {
+                    let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
+                    // Forget the permit only after the send succeeds so credits are
+                    // not permanently lost when the channel has already closed.
+                    if tunnel_tx_clone.send(frame).is_err() {
+                        drop(permit);
+                        break;
+                    }
                     if let Some(p) = permit {
                         p.forget();
-                    }
-                    let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
-                    if tunnel_tx_clone.send(frame).is_err() {
-                        break;
                     }
                 }
                 Err(e) => {

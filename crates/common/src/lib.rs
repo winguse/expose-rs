@@ -176,4 +176,53 @@ mod tests {
     fn decode_too_short() {
         assert!(Frame::decode(&[0u8; 4]).is_err());
     }
+
+    #[test]
+    fn decode_payload_truncated() {
+        // Header claims 4-byte payload but only 2 bytes follow.
+        let mut buf = vec![0u8; 9];
+        buf[4] = FRAME_DATA;
+        buf[8] = 4; // payload_len = 4
+        buf.extend_from_slice(&[0u8, 0]); // only 2 bytes instead of 4
+        assert!(Frame::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn ack_count_wrong_frame_type_errors() {
+        let f = Frame::data(1, b"hello".to_vec());
+        assert!(f.ack_count().is_err());
+    }
+
+    #[test]
+    fn ack_count_wrong_payload_length_errors() {
+        // Manually craft a frame with FRAME_ACK but a 2-byte payload.
+        let f = Frame {
+            conn_id: 1,
+            frame_type: FRAME_ACK,
+            payload: vec![0u8, 0],
+        };
+        assert!(f.ack_count().is_err());
+    }
+
+    #[test]
+    fn ack_count_zero() {
+        let f = Frame::ack(1, 0);
+        assert_eq!(f.ack_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn ack_count_max_u32() {
+        let f = Frame::ack(1, u32::MAX);
+        assert_eq!(f.ack_count().unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn encode_decode_preserves_extra_bytes_in_buffer() {
+        // decode() must ignore trailing bytes beyond payload_len.
+        let f = Frame::data(5, b"hi".to_vec());
+        let mut enc = f.encode();
+        enc.extend_from_slice(b"garbage");
+        let dec = Frame::decode(&enc).unwrap();
+        assert_eq!(dec.payload, b"hi");
+    }
 }
