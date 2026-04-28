@@ -174,7 +174,8 @@ async fn test_large_data() {
 
     wait_until_tunnel_ready(server_addr).await;
 
-    // 512 KiB of data.
+    // 512 KiB of data.  251 is prime, so the byte pattern does not repeat on
+    // power-of-two boundaries — useful for catching alignment-related bugs.
     let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(512 * 1024).collect();
 
     let mut stream = TcpStream::connect(server_addr).await.unwrap();
@@ -297,6 +298,495 @@ async fn test_sequential_connections() {
 
         assert_eq!(buf, payload.as_bytes(), "round {round}");
     }
+
+    server_task.abort();
+    client_task.abort();
+}
+
+// ── Tunnel-reconnect race regression ──────────────────────────────────────────
+
+/// Regression test for the stale-cleanup race.
+///
+/// Sequence:
+///   1. Client A connects → becomes the active tunnel.
+///   2. Client B connects → B becomes the active tunnel (A is replaced).
+///   3. Client A's task is aborted → A's WebSocket closes.
+///   4. Server-side `handle_tunnel` for A detects the WS close and runs its
+///      cleanup code.
+///
+/// BUG (before fix): Cleanup unconditionally set `tunnel_tx = None`, clobbering
+/// B's sender and permanently breaking the tunnel for B.
+///
+/// FIXED: Cleanup compares the session counter stored when the tunnel registered;
+/// if a newer tunnel already connected, cleanup does nothing to `tunnel_tx`.
+#[tokio::test]
+async fn test_tunnel_reconnect_cleanup_race() {
+    let upstream = start_echo_server().await;
+
+    let secret = "reconnect-race-secret".to_string();
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener,
+        secret.clone(),
+        expose_server::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let ws_url = format!("ws://{}/{}", server_addr, secret);
+
+    // Phase 1: Client A connects and becomes the active tunnel.
+    let client_a_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url.clone(),
+        upstream.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
+    wait_until_tunnel_ready(server_addr).await;
+
+    // Phase 2: Client B connects, atomically replacing A as the active tunnel.
+    let client_b_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url.clone(),
+        upstream.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
+    // Give B time to complete the WebSocket handshake with the server before
+    // we abort A.  150 ms is ample for a loopback WS handshake.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Phase 3: Abort A's task.  This drops A's WebSocket, causing the server's
+    // handle_tunnel for A to see a WS error and run its cleanup code.
+    client_a_task.abort();
+
+    // Phase 4: Give the server time to detect A's disconnect and execute cleanup.
+    // 300 ms covers the WS error propagation + task scheduling latency.
+    // If the bug is present the cleanup sets tunnel_tx = None, breaking B's tunnel.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Phase 5: Verify B's tunnel is still operational.
+    // wait_until_tunnel_ready panics if the tunnel is broken (regression path).
+    wait_until_tunnel_ready(server_addr).await;
+
+    // Extra echo round-trip to be sure.
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    stream.write_all(b"post-reconnect").await.unwrap();
+    let mut buf = vec![0u8; 14];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("read timed out after reconnect")
+        .expect("read failed after reconnect");
+    assert_eq!(&buf, b"post-reconnect");
+
+    server_task.abort();
+    client_b_task.abort();
+}
+
+// ── Upstream-refused ──────────────────────────────────────────────────────────
+
+/// When the upstream service is not listening, the client sends CLOSE and the
+/// visitor's TCP connection receives a clean EOF (read returns 0).
+///
+/// The visitor must send at least one byte so the server's `peek()` can classify
+/// the connection as a proxy request and route it to `handle_proxy`.
+#[tokio::test]
+async fn test_upstream_refused() {
+    // Bind a listener to get a free port, then drop it so the port is unoccupied.
+    let dummy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let refused_addr = dummy.local_addr().unwrap();
+    drop(dummy);
+
+    let secret = "refused-secret".to_string();
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener,
+        secret.clone(),
+        expose_server::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let ws_url = format!("ws://{}/{}", server_addr, secret);
+    let client_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url,
+        refused_addr.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
+    // Wait for the WebSocket handshake to complete.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The visitor must write at least one byte so the server's peek() can
+    // classify the connection as a proxy request and proceed to handle_proxy.
+    // Server sends OPEN → client fails to reach upstream → client sends CLOSE
+    // → server shuts down the visitor's write half → read = 0.
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    stream.write_all(b"x").await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .expect("read timed out when upstream is refused")
+        .expect("read error when upstream is refused");
+    assert_eq!(
+        n, 0,
+        "visitor stream should be closed when upstream is refused"
+    );
+
+    server_task.abort();
+    client_task.abort();
+}
+
+// ── Flow-control with a small window ─────────────────────────────────────────
+
+/// Verify that the semaphore-based flow control does not deadlock or lose data
+/// when the per-connection window is small (80 messages, just above the ACK
+/// batch size of 64 to avoid deadlock while still exercising flow-control waits).
+#[tokio::test]
+async fn test_flow_control_small_limit() {
+    let upstream = start_echo_server().await;
+
+    // The flow-control window must be ≥ ACK_BATCH_SIZE (64) or the sender will
+    // exhaust its permits before the receiver ever sends an ACK, causing a deadlock.
+    // 80 sits just above that threshold and still forces multiple ACK round-trips.
+    let limit = 80;
+    let secret = "flow-secret".to_string();
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener,
+        secret.clone(),
+        expose_server::CapacityConfig {
+            max_pending_messages_per_connection: limit,
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let ws_url = format!("ws://{}/{}", server_addr, secret);
+    let client_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url,
+        upstream.to_string(),
+        expose_client::CapacityConfig {
+            max_pending_messages_per_connection: limit,
+        },
+    ));
+
+    wait_until_tunnel_ready(server_addr).await;
+
+    // 256 KiB — enough to exercise many flow-control cycles with this window.
+    // 251 is prime so the byte pattern does not repeat on power-of-two boundaries.
+    let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(256 * 1024).collect();
+
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    stream.write_all(&payload).await.unwrap();
+
+    let mut received = vec![0u8; payload.len()];
+    timeout(Duration::from_secs(30), stream.read_exact(&mut received))
+        .await
+        .expect("read timed out with small flow-control window")
+        .expect("read failed with small flow-control window");
+
+    assert_eq!(received, payload, "data must be intact under flow control");
+
+    server_task.abort();
+    client_task.abort();
+}
+
+// ── TCP proxy patterns ────────────────────────────────────────────────────────
+
+/// Upstream that handles a simple length-prefixed request/response protocol:
+///
+///   → 1-byte payload length  +  N bytes of payload
+///   ← the same N bytes echoed back (no length prefix)
+///
+/// This lets us do multiple distinct round trips over a single persistent
+/// connection and verify that the proxy does not prematurely close it.
+async fn start_request_response_upstream() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut rx, mut tx) = stream.into_split();
+                        loop {
+                            // Read 1-byte length prefix.
+                            let mut len_buf = [0u8; 1];
+                            if rx.read_exact(&mut len_buf).await.is_err() {
+                                break;
+                            }
+                            let n = len_buf[0] as usize;
+                            if n == 0 {
+                                break;
+                            }
+                            let mut payload = vec![0u8; n];
+                            if rx.read_exact(&mut payload).await.is_err() {
+                                break;
+                            }
+                            if tx.write_all(&payload).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
+/// Multiple request/response round trips over a single persistent TCP connection.
+///
+/// Exercises the common case of a protocol that reuses one connection for
+/// many sequential exchanges (e.g. HTTP keep-alive, Redis pipelining, MySQL).
+/// Verifies that the proxy does not close the connection between rounds and
+/// that data from different rounds is not mixed up.
+#[tokio::test]
+async fn test_multiple_request_response() {
+    let upstream = start_request_response_upstream().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+    // Wait for the WebSocket handshake between server and client to complete.
+    // We can't use wait_until_tunnel_ready here because the specialized upstream
+    // doesn't speak a simple echo protocol.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+
+    // 20 round trips with payloads of varying sizes.
+    let rounds: Vec<Vec<u8>> = (1u8..=20)
+        .map(|i| vec![i; i as usize]) // round i → i bytes all equal to i
+        .collect();
+
+    for (idx, payload) in rounds.iter().enumerate() {
+        let len = payload.len() as u8;
+        // Send length-prefix + payload.
+        stream
+            .write_all(&[len])
+            .await
+            .unwrap_or_else(|e| panic!("round {idx}: write len failed: {e}"));
+        stream
+            .write_all(payload)
+            .await
+            .unwrap_or_else(|e| panic!("round {idx}: write payload failed: {e}"));
+
+        // Read the echo back.
+        let mut buf = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("round {idx}: read timed out"))
+            .unwrap_or_else(|e| panic!("round {idx}: read failed: {e}"));
+
+        assert_eq!(&buf, payload, "round {idx}: echo mismatch");
+    }
+
+    // Graceful shutdown.
+    stream.write_all(&[0u8]).await.ok(); // length = 0 → upstream closes
+    stream.shutdown().await.ok();
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// Both sides (visitor and upstream) stream large payloads to each other
+/// simultaneously, without waiting for the other side.
+///
+/// This exercises the full-duplex path: both tunnel directions are saturated
+/// at the same time.  Any head-of-line blocking or buffer-management bug
+/// that stalls one direction while the other is active will cause a deadlock
+/// or data corruption that is caught here.
+#[tokio::test]
+async fn test_bidirectional_concurrent_streaming() {
+    // Upstream reads all incoming bytes and discards them while independently
+    // sending a large block of its own data, then closes.
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_payload: Vec<u8> = (0u32..).map(|i| (i % 199) as u8).take(128 * 1024).collect();
+    let upstream_payload_clone = upstream_payload.clone();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = upstream_listener.accept().await {
+            let (mut rx, mut tx) = stream.into_split();
+            // Drain all incoming data in the background.
+            tokio::spawn(async move {
+                let mut sink = vec![0u8; 4096];
+                while rx.read(&mut sink).await.map(|n| n > 0).unwrap_or(false) {}
+            });
+            // Immediately send the upstream payload.
+            let _ = tx.write_all(&upstream_payload_clone).await;
+            let _ = tx.shutdown().await;
+        }
+    });
+
+    let (server_addr, server_task, client_task) = start_tunnel(upstream_addr).await;
+    // Wait for the WebSocket handshake; the specialized upstream can't be probed
+    // with a plain echo round-trip.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let stream = TcpStream::connect(server_addr).await.unwrap();
+
+    // Visitor payload — prime-period pattern, different from the upstream one.
+    let visitor_payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(128 * 1024).collect();
+
+    // Split the stream so we can read and write concurrently.
+    let (mut rx, mut tx) = stream.into_split();
+
+    let send_task = tokio::spawn(async move {
+        tx.write_all(&visitor_payload).await.ok();
+        tx.shutdown().await.ok();
+    });
+
+    // Read the entire upstream payload.
+    let mut received = vec![0u8; upstream_payload.len()];
+    timeout(Duration::from_secs(15), rx.read_exact(&mut received))
+        .await
+        .expect("bidirectional: read timed out")
+        .expect("bidirectional: read failed");
+
+    send_task.await.ok();
+    assert_eq!(
+        received, upstream_payload,
+        "upstream→visitor data must be intact"
+    );
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// Upstream that accepts a connection, waits for a short delay, then echoes.
+///
+/// Tests that the proxy holds the connection alive when the upstream is slow
+/// to respond — the visitor must not see a premature EOF.
+#[tokio::test]
+async fn test_slow_upstream_response() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = upstream_listener.accept().await {
+            let (mut rx, mut tx) = stream.into_split();
+            let mut buf = vec![0u8; 64];
+            let n = rx.read(&mut buf).await.unwrap_or(0);
+            // Simulate processing delay.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = tx.write_all(&buf[..n]).await;
+            let _ = tx.shutdown().await;
+        }
+    });
+
+    let (server_addr, server_task, client_task) = start_tunnel(upstream_addr).await;
+    // Wait for the WebSocket handshake; the specialized upstream can't be probed
+    // with a plain echo round-trip.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    let payload = b"slow-upstream-test";
+    stream.write_all(payload).await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    // Allow plenty of time (3 s) for the 400 ms upstream delay + tunnel overhead.
+    timeout(Duration::from_secs(3), stream.read_exact(&mut buf))
+        .await
+        .expect("slow upstream: read timed out")
+        .expect("slow upstream: read failed");
+
+    assert_eq!(buf, payload, "slow upstream: echoed data must match");
+
+    server_task.abort();
+    client_task.abort();
+}
+
+// ── Write-error propagation ───────────────────────────────────────────────────
+
+/// When the upstream connection is forcefully reset while data is in flight,
+/// the client writer detects the write error, sends FRAME_WRITE_ERROR to the
+/// server, and the server closes the visitor's connection cleanly.
+///
+/// Scenario: upstream accepts, reads one byte, then immediately drops the
+/// connection (RST).  The server sends enough data to trigger a write error on
+/// the client side.  The server must receive FRAME_WRITE_ERROR and close the
+/// visitor connection rather than hanging.
+#[tokio::test]
+async fn test_client_write_error_propagated_to_server() {
+    // Upstream that accepts, reads one byte, then RSTs.
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = upstream_listener.accept().await {
+            let (mut rx, _tx) = stream.into_split();
+            let mut buf = [0u8; 1];
+            let _ = rx.read(&mut buf).await;
+            // stream (and _tx) dropped here → RST / FIN to client side
+        }
+    });
+
+    let secret = "write-err-client".to_string();
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener,
+        secret.clone(),
+        expose_server::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let ws_url = format!("ws://{}/{}", server_addr, secret);
+    let client_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url,
+        upstream_addr.to_string(),
+        expose_client::CapacityConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect visitor.  Send some data; upstream drops the connection after one
+    // byte which will cause write errors on the client side.
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    // Send enough to flow through the tunnel so the upstream write error can fire.
+    stream.write_all(&vec![0u8; 64]).await.unwrap();
+
+    // The visitor's connection must be closed (EOF) within 3 s — the server
+    // receives FRAME_WRITE_ERROR and shuts down the visitor socket.
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .expect("timed out: server did not close visitor conn after upstream write error")
+        .expect("read error");
+    assert_eq!(
+        n, 0,
+        "visitor connection must be closed after upstream write error"
+    );
+
+    server_task.abort();
+    client_task.abort();
+}
+
+/// When the visitor resets its TCP connection while the server is writing data
+/// to it, the server writer detects the write error, sends FRAME_WRITE_ERROR to
+/// the client, and the client stops forwarding data from upstream.
+///
+/// After the error the tunnel itself must remain operational for new connections.
+#[tokio::test]
+async fn test_server_write_error_propagated_to_client() {
+    let upstream = start_echo_server().await;
+    let (server_addr, server_task, client_task) = start_tunnel(upstream).await;
+    wait_until_tunnel_ready(server_addr).await;
+
+    // Connect a visitor that will RST immediately after sending data.
+    let std_stream = std::net::TcpStream::connect(server_addr).unwrap();
+    // SO_LINGER = 0 → RST instead of FIN on close.
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let sock = unsafe { socket2::Socket::from_raw_fd(std_stream.as_raw_fd()) };
+        sock.set_linger(Some(Duration::ZERO)).unwrap();
+        std::mem::forget(sock); // don't close the fd twice
+    }
+    std_stream.set_nonblocking(true).unwrap();
+    let mut visitor = TcpStream::from_std(std_stream).unwrap();
+    // Send data so the echo path is active, then RST.
+    visitor.write_all(&vec![0u8; 4096]).await.unwrap();
+    drop(visitor); // RST
+
+    // Give the error time to propagate through the tunnel.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Tunnel must still be operational — FRAME_WRITE_ERROR must not have broken
+    // the WebSocket or left the server in an inconsistent state.
+    wait_until_tunnel_ready(server_addr).await;
 
     server_task.abort();
     client_task.abort();

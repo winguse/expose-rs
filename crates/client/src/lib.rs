@@ -1,6 +1,6 @@
 use expose_common::{
     acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, FRAME_ACK, FRAME_CLOSE, FRAME_DATA,
-    FRAME_OPEN,
+    FRAME_OPEN, FRAME_WRITE_ERROR,
 };
 pub use expose_common::{
     CapacityConfig, ACK_BATCH_SIZE, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
@@ -10,7 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -20,18 +20,16 @@ struct ConnEntry {
     remote_closed: bool,
     /// Upstream → tunnel: credits until the server ACKs after writing to the visitor.
     inflight_to_server: Option<Arc<tokio::sync::Semaphore>>,
+    /// Signal sent to the local reader when a FRAME_WRITE_ERROR is received from
+    /// the peer.  The reader selects on this to stop gracefully without abort.
+    peer_write_error: watch::Sender<bool>,
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, ConnEntry>>>;
 
 enum ProxyMsg {
-    Data { payload: Vec<u8> },
-    Close,
-}
-
-enum WsOutMsg {
-    Frame(Vec<u8>),
     Data(Vec<u8>),
+    Close,
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -72,15 +70,11 @@ async fn run_client(
     channel_config: CapacityConfig,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsOutMsg>();
+    // Single outgoing channel for all frames (ACKs, CLOSE, DATA).
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let bytes = match msg {
-                WsOutMsg::Frame(bytes) => bytes,
-                WsOutMsg::Data(bytes) => bytes,
-            };
-
+        while let Some(bytes) = out_rx.recv().await {
             if ws_tx.send(Message::Binary(bytes)).await.is_err() {
                 break;
             }
@@ -122,7 +116,7 @@ async fn run_client(
 
 async fn handle_frame(
     frame: Frame,
-    out_tx: mpsc::UnboundedSender<WsOutMsg>,
+    out_tx: mpsc::UnboundedSender<Vec<u8>>,
     upstream: String,
     conn_map: ConnMap,
     channel_config: CapacityConfig,
@@ -133,12 +127,14 @@ async fn handle_frame(
             let inflight_to_server =
                 semaphore_for_limit(channel_config.max_pending_messages_per_connection);
             let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
+            let (peer_write_error_tx, peer_write_error_rx) = watch::channel(false);
             conn_map.lock().await.insert(
                 conn_id,
                 ConnEntry {
-                    tx: data_tx.clone(),
+                    tx: data_tx,
                     remote_closed: false,
-                    inflight_to_server,
+                    inflight_to_server: inflight_to_server.clone(),
+                    peer_write_error: peer_write_error_tx,
                 },
             );
 
@@ -152,7 +148,16 @@ async fn handle_frame(
                             return;
                         }
 
-                        proxy_conn(conn_id, stream, data_rx, out_tx_clone, conn_map_clone).await;
+                        proxy_conn(
+                            conn_id,
+                            stream,
+                            data_rx,
+                            out_tx_clone,
+                            conn_map_clone,
+                            inflight_to_server,
+                            peer_write_error_rx,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         error!(
@@ -160,7 +165,7 @@ async fn handle_frame(
                             upstream, conn_id, e
                         );
                         conn_map_clone.lock().await.remove(&conn_id);
-                        let _ = out_tx_clone.send(WsOutMsg::Frame(Frame::close(conn_id).encode()));
+                        let _ = out_tx_clone.send(Frame::close(conn_id).encode());
                     }
                 }
             });
@@ -202,9 +207,7 @@ async fn handle_frame(
                 }
             };
             if let Some(tx) = conn {
-                let _ = tx.send(ProxyMsg::Data {
-                    payload: frame.payload,
-                });
+                let _ = tx.send(ProxyMsg::Data(frame.payload));
             }
         }
 
@@ -227,6 +230,17 @@ async fn handle_frame(
             }
         }
 
+        FRAME_WRITE_ERROR => {
+            // The server could not write to the visitor.
+            // * Signal our local reader to stop gracefully (via watch channel).
+            // * Do NOT remove conn_id from conn_map here; cleanup happens after
+            //   both tasks finish in proxy_conn.
+            let map = conn_map.lock().await;
+            if let Some(entry) = map.get(&frame.conn_id) {
+                let _ = entry.peer_write_error.send(true);
+            }
+        }
+
         other => {
             warn!("Unexpected frame type {:#04x} from server", other);
         }
@@ -239,64 +253,97 @@ async fn proxy_conn(
     conn_id: u32,
     stream: TcpStream,
     mut data_rx: mpsc::UnboundedReceiver<ProxyMsg>,
-    out_tx: mpsc::UnboundedSender<WsOutMsg>,
+    out_tx: mpsc::UnboundedSender<Vec<u8>>,
     conn_map: ConnMap,
+    // Semaphore passed in directly so the reader does not need to lock conn_map
+    // on every iteration just to retrieve an immutable Arc clone.
+    inflight_to_server: Option<Arc<tokio::sync::Semaphore>>,
+    // Watch receiver signalled when a FRAME_WRITE_ERROR arrives from the server.
+    peer_write_error_rx: watch::Receiver<bool>,
 ) {
     let (mut tcp_rx, mut tcp_tx) = stream.into_split();
     let out_tx_clone = out_tx.clone();
-    let conn_map_for_reader = Arc::clone(&conn_map);
     let mut write_ack_count: u32 = 0;
 
     let reader = tokio::spawn(async move {
+        let mut peer_write_error_rx = peer_write_error_rx;
         let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let sem = {
-                let map = conn_map_for_reader.lock().await;
-                match map.get(&conn_id) {
-                    Some(entry) => entry.inflight_to_server.clone(),
-                    None => break,
+        let mut stopped_by_peer_error = false;
+        'reader: loop {
+            // Wait for a flow-control permit, but also watch for a peer write
+            // error signal so we don't block here indefinitely when the server
+            // stops sending ACKs after its own write error.
+            let permit;
+            tokio::select! {
+                _ = peer_write_error_rx.changed() => {
+                    stopped_by_peer_error = true;
+                    break 'reader;
                 }
-            };
+                p = acquire_permit(&inflight_to_server) => { permit = p; }
+            }
 
-            let permit = acquire_permit(&sem).await;
-
-            match tcp_rx.read(&mut buf).await {
-                Ok(0) => {
+            // Read from upstream TCP, but also watch for the peer write error
+            // signal so we exit gracefully without aborting the task.
+            tokio::select! {
+                _ = peer_write_error_rx.changed() => {
                     drop(permit);
-                    break;
+                    stopped_by_peer_error = true;
+                    break 'reader;
                 }
-                Ok(n) => {
-                    if let Some(p) = permit {
-                        p.forget();
+                result = tcp_rx.read(&mut buf) => {
+                    match result {
+                        Ok(0) => {
+                            drop(permit);
+                            break 'reader;
+                        }
+                        Ok(n) => {
+                            let bytes = Frame::data(conn_id, buf[..n].to_vec()).encode();
+                            // Forget the permit only after the send succeeds so credits
+                            // are not permanently lost when the channel has already closed.
+                            if out_tx_clone.send(bytes).is_err() {
+                                drop(permit);
+                                break 'reader;
+                            }
+                            if let Some(p) = permit {
+                                p.forget();
+                            }
+                        }
+                        Err(e) => {
+                            drop(permit);
+                            error!("Read from upstream error for conn {}: {}", conn_id, e);
+                            break 'reader;
+                        }
                     }
-                    let msg = WsOutMsg::Data(Frame::data(conn_id, buf[..n].to_vec()).encode());
-                    if out_tx_clone.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    drop(permit);
-                    error!("Read from upstream error for conn {}: {}", conn_id, e);
-                    break;
                 }
             }
         }
-        let _ = out_tx_clone.send(WsOutMsg::Frame(Frame::close(conn_id).encode()));
+        // Only send FRAME_CLOSE on a normal read EOF / error.  When stopped by a
+        // peer write-error signal the peer already knows — sending FRAME_CLOSE
+        // would be confusing and redundant.
+        if !stopped_by_peer_error {
+            let _ = out_tx_clone.send(Frame::close(conn_id).encode());
+        }
     });
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = data_rx.recv().await {
             match msg {
-                ProxyMsg::Data { payload } => {
-                    let write_result = tcp_tx.write_all(&payload).await;
-                    if write_result.is_err() {
+                ProxyMsg::Data(payload) => {
+                    if let Err(e) = tcp_tx.write_all(&payload).await {
+                        error!(
+                            "Upstream write error for conn {}: {}; notifying server",
+                            conn_id, e
+                        );
+                        // Signal the peer with FRAME_WRITE_ERROR.  We intentionally
+                        // do NOT abort the reader or remove conn_id from conn_map
+                        // here — the reader keeps running and conn_map is cleaned up
+                        // after both tasks finish.
+                        let _ = out_tx.send(Frame::write_error(conn_id).encode());
                         break;
                     }
                     write_ack_count = write_ack_count.saturating_add(1);
                     if write_ack_count >= ACK_BATCH_SIZE {
-                        let _ = out_tx.send(WsOutMsg::Frame(
-                            Frame::ack(conn_id, write_ack_count).encode(),
-                        ));
+                        let _ = out_tx.send(Frame::ack(conn_id, write_ack_count).encode());
                         write_ack_count = 0;
                     }
                 }
@@ -304,9 +351,7 @@ async fn proxy_conn(
             }
         }
         if write_ack_count > 0 {
-            let _ = out_tx.send(WsOutMsg::Frame(
-                Frame::ack(conn_id, write_ack_count).encode(),
-            ));
+            let _ = out_tx.send(Frame::ack(conn_id, write_ack_count).encode());
         }
         let _ = tcp_tx.shutdown().await;
     });

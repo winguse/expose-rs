@@ -17,6 +17,10 @@ pub const FRAME_DATA: u8 = 0x02;
 pub const FRAME_CLOSE: u8 = 0x03;
 /// Bidirectional: peer acknowledged written DATA frames. Payload is u32 count.
 pub const FRAME_ACK: u8 = 0x04;
+/// Bidirectional: TCP write on the sending side failed (e.g. broken pipe, connection
+/// reset).  The receiver must stop sending DATA for this connection and treat it as
+/// fully closed.  Distinct from FRAME_CLOSE (which signals a clean EOF / half-close).
+pub const FRAME_WRITE_ERROR: u8 = 0x05;
 
 // ── Wire layout ──────────────────────────────────────────────────────────────
 //
@@ -58,6 +62,14 @@ impl Frame {
         Frame {
             conn_id,
             frame_type: FRAME_CLOSE,
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn write_error(conn_id: u32) -> Self {
+        Frame {
+            conn_id,
+            frame_type: FRAME_WRITE_ERROR,
             payload: Vec::new(),
         }
     }
@@ -175,5 +187,54 @@ mod tests {
     #[test]
     fn decode_too_short() {
         assert!(Frame::decode(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated() {
+        // Header claims 4-byte payload but only 2 bytes follow.
+        let mut buf = vec![0u8; 9];
+        buf[4] = FRAME_DATA;
+        buf[8] = 4; // payload_len = 4
+        buf.extend_from_slice(&[0u8, 0]); // only 2 bytes instead of 4
+        assert!(Frame::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn ack_count_wrong_frame_type_errors() {
+        let f = Frame::data(1, b"hello".to_vec());
+        assert!(f.ack_count().is_err());
+    }
+
+    #[test]
+    fn ack_count_wrong_payload_length_errors() {
+        // Manually craft a frame with FRAME_ACK but a 2-byte payload.
+        let f = Frame {
+            conn_id: 1,
+            frame_type: FRAME_ACK,
+            payload: vec![0u8, 0],
+        };
+        assert!(f.ack_count().is_err());
+    }
+
+    #[test]
+    fn ack_count_zero() {
+        let f = Frame::ack(1, 0);
+        assert_eq!(f.ack_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn ack_count_max_u32() {
+        let f = Frame::ack(1, u32::MAX);
+        assert_eq!(f.ack_count().unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn encode_decode_preserves_extra_bytes_in_buffer() {
+        // decode() must ignore trailing bytes beyond payload_len.
+        let f = Frame::data(5, b"hi".to_vec());
+        let mut enc = f.encode();
+        enc.extend_from_slice(b"garbage");
+        let dec = Frame::decode(&enc).unwrap();
+        assert_eq!(dec.payload, b"hi");
     }
 }

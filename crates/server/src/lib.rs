@@ -1,6 +1,6 @@
 use expose_common::{
     acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, ACK_BATCH_SIZE, FRAME_ACK,
-    FRAME_CLOSE, FRAME_DATA,
+    FRAME_CLOSE, FRAME_DATA, FRAME_WRITE_ERROR,
 };
 pub use expose_common::{CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION};
 use futures_util::{SinkExt, StreamExt};
@@ -14,13 +14,26 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
+// ── Tunnel state ─────────────────────────────────────────────────────────────
+
+/// Holds the active tunnel sender together with a monotone session counter.
+///
+/// The session counter is incremented each time a new tunnel WebSocket connects.
+/// Cleanup code checks that the session hasn't advanced before clearing the
+/// sender, preventing a race where stale cleanup from an old tunnel clobbers
+/// the newly-registered sender of a replacement tunnel.
+struct TunnelState {
+    session: u64,
+    tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+}
+
 struct AppState {
-    tunnel_tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    tunnel: Mutex<TunnelState>,
     conn_map: Mutex<HashMap<u32, ConnEntry>>,
     next_id: AtomicU32,
     config: CapacityConfig,
@@ -31,6 +44,9 @@ struct ConnEntry {
     remote_closed: bool,
     /// Visitor → tunnel: credits until the client ACKs after writing to upstream.
     inflight_to_tunnel: Option<Arc<tokio::sync::Semaphore>>,
+    /// Signal sent to the local reader when a FRAME_WRITE_ERROR is received from
+    /// the peer.  The reader selects on this to stop gracefully without abort.
+    peer_write_error: watch::Sender<bool>,
 }
 
 enum ProxyMsg {
@@ -41,7 +57,10 @@ enum ProxyMsg {
 impl AppState {
     fn new(config: CapacityConfig) -> Self {
         AppState {
-            tunnel_tx: Mutex::new(None),
+            tunnel: Mutex::new(TunnelState {
+                session: 0,
+                tx: None,
+            }),
             conn_map: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             config,
@@ -123,11 +142,24 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    {
-        let mut guard = state.tunnel_tx.lock().await;
-        *guard = Some(tunnel_tx);
-        state.conn_map.lock().await.clear();
-    }
+    // Register this tunnel and record our session ID.
+    // Incrementing the session counter atomically (under the lock) lets cleanup
+    // distinguish itself from a newer tunnel that may have registered in the meantime.
+    //
+    // The counter is u64 and increments once per tunnel connection.  Overflow would
+    // require ~1.8 × 10¹⁹ reconnections — practically impossible — but note that if
+    // it ever did wrap around exactly to a previous value the stale-cleanup guard
+    // would fail to protect that specific session.  The wrapping_add is intentional
+    // to avoid a panic in debug builds.
+    let my_session = {
+        let mut guard = state.tunnel.lock().await;
+        guard.session = guard.session.wrapping_add(1);
+        let session = guard.session;
+        guard.tx = Some(tunnel_tx);
+        session
+        // guard is dropped here — conn_map is cleared without holding the tunnel lock
+    };
+    state.conn_map.lock().await.clear();
 
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = tunnel_rx.recv().await {
@@ -155,9 +187,20 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
 
     info!("Tunnel client disconnected");
 
-    {
-        let mut guard = state.tunnel_tx.lock().await;
-        *guard = None;
+    // Only clear tunnel state if no newer tunnel has registered since us.
+    // Without this check a stale cleanup from an old tunnel would set
+    // tunnel_tx = None after a replacement tunnel has already written its sender
+    // into the slot, permanently breaking the new tunnel.
+    let was_active = {
+        let mut guard = state.tunnel.lock().await;
+        if guard.session == my_session {
+            guard.tx = None;
+            true
+        } else {
+            false
+        }
+    };
+    if was_active {
         state.conn_map.lock().await.clear();
     }
 
@@ -211,6 +254,16 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
                 let _ = tx.send(ProxyMsg::Close);
             }
         }
+        FRAME_WRITE_ERROR => {
+            // The client could not write to upstream.
+            // * Signal our local reader to stop gracefully (via watch channel).
+            // * Do NOT remove conn_id from conn_map here; cleanup happens after
+            //   both tasks finish in handle_proxy.
+            let map = state.conn_map.lock().await;
+            if let Some(entry) = map.get(&frame.conn_id) {
+                let _ = entry.peer_write_error.send(true);
+            }
+        }
         other => {
             warn!("Unexpected frame type {:#04x} from tunnel", other);
         }
@@ -219,8 +272,8 @@ async fn dispatch_from_tunnel(frame: Frame, state: &AppState) {
 
 async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let tunnel_tx = {
-        let guard = state.tunnel_tx.lock().await;
-        match guard.as_ref() {
+        let guard = state.tunnel.lock().await;
+        match guard.tx.as_ref() {
             Some(tx) => tx.clone(),
             None => {
                 warn!("No tunnel client connected; dropping incoming connection");
@@ -232,12 +285,15 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let conn_id = state.next_conn_id();
     let inflight_to_tunnel = semaphore_for_limit(state.config.max_pending_messages_per_connection);
     let (data_tx, data_rx) = mpsc::unbounded_channel::<ProxyMsg>();
+    let (peer_write_error_tx, peer_write_error_rx) = watch::channel(false);
+
     state.conn_map.lock().await.insert(
         conn_id,
         ConnEntry {
             tx: data_tx,
             remote_closed: false,
             inflight_to_tunnel: inflight_to_tunnel.clone(),
+            peer_write_error: peer_write_error_tx,
         },
     );
 
@@ -252,31 +308,63 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
     let tunnel_tx_clone = tunnel_tx.clone();
 
     let reader = tokio::spawn(async move {
+        let mut peer_write_error_rx = peer_write_error_rx;
         let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let permit = acquire_permit(&inflight_to_tunnel).await;
-            match tcp_rx.read(&mut buf).await {
-                Ok(0) => {
-                    drop(permit);
-                    break;
+        let mut stopped_by_peer_error = false;
+        'reader: loop {
+            // Wait for a flow-control permit, but also watch for a peer write
+            // error signal so we don't block here indefinitely when the peer
+            // stops sending ACKs after its own write error.
+            let permit;
+            tokio::select! {
+                _ = peer_write_error_rx.changed() => {
+                    stopped_by_peer_error = true;
+                    break 'reader;
                 }
-                Ok(n) => {
-                    if let Some(p) = permit {
-                        p.forget();
-                    }
-                    let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
-                    if tunnel_tx_clone.send(frame).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
+                p = acquire_permit(&inflight_to_tunnel) => { permit = p; }
+            }
+
+            // Read from the visitor TCP, but also watch for the peer write error
+            // signal so we exit gracefully without aborting the task.
+            tokio::select! {
+                _ = peer_write_error_rx.changed() => {
                     drop(permit);
-                    error!("TCP read error for conn {}: {}", conn_id, e);
-                    break;
+                    stopped_by_peer_error = true;
+                    break 'reader;
+                }
+                result = tcp_rx.read(&mut buf) => {
+                    match result {
+                        Ok(0) => {
+                            drop(permit);
+                            break 'reader;
+                        }
+                        Ok(n) => {
+                            let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
+                            // Forget the permit only after the send succeeds so credits
+                            // are not permanently lost when the channel has already closed.
+                            if tunnel_tx_clone.send(frame).is_err() {
+                                drop(permit);
+                                break 'reader;
+                            }
+                            if let Some(p) = permit {
+                                p.forget();
+                            }
+                        }
+                        Err(e) => {
+                            drop(permit);
+                            error!("TCP read error for conn {}: {}", conn_id, e);
+                            break 'reader;
+                        }
+                    }
                 }
             }
         }
-        let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode());
+        // Only send FRAME_CLOSE on a normal read EOF / error.  When stopped by a
+        // peer write-error signal the peer already knows — sending FRAME_CLOSE
+        // would be confusing and redundant.
+        if !stopped_by_peer_error {
+            let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode());
+        }
     });
 
     let writer = tokio::spawn(async move {
@@ -285,7 +373,16 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         while let Some(msg) = rx.recv().await {
             match msg {
                 ProxyMsg::Data(payload) => {
-                    if tcp_tx.write_all(&payload).await.is_err() {
+                    if let Err(e) = tcp_tx.write_all(&payload).await {
+                        error!(
+                            "TCP write error for conn {}: {}; notifying client",
+                            conn_id, e
+                        );
+                        // Signal the peer with FRAME_WRITE_ERROR.  We intentionally
+                        // do NOT abort the reader or remove conn_id from conn_map
+                        // here — the reader keeps running and conn_map is cleaned up
+                        // after both tasks finish.
+                        let _ = tunnel_tx.send(Frame::write_error(conn_id).encode());
                         break;
                     }
                     ack_batch = ack_batch.saturating_add(1);
