@@ -424,7 +424,10 @@ async fn test_upstream_refused() {
         .await
         .expect("read timed out when upstream is refused")
         .expect("read error when upstream is refused");
-    assert_eq!(n, 0, "visitor stream should be closed when upstream is refused");
+    assert_eq!(
+        n, 0,
+        "visitor stream should be closed when upstream is refused"
+    );
 
     server_task.abort();
     client_task.abort();
