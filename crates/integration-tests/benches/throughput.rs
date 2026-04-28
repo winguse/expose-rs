@@ -22,20 +22,20 @@
 //!
 //! | Payload size | Via tunnel (avg/s) | Direct baseline (avg/s) |
 //! |--------------|--------------------|-------------------------|
-//! | 512 B        | TBD                | TBD                     |
-//! | 1 KiB        | TBD                | TBD                     |
-//! | 16 KiB       | TBD                | TBD                     |
-//! | 64 KiB       | TBD                | TBD                     |
-//! | 1 MiB        | TBD                | TBD                     |
+//! | 512 B        | 271.71 KiB/s       | 8.24 MiB/s              |
+//! | 1 KiB        | 651.09 KiB/s       | 16.57 MiB/s             |
+//! | 16 KiB       | 707.77 KiB/s       | 783.06 KiB/s            |
+//! | 64 KiB       | 1.40 MiB/s         | 11.90 MiB/s             |
+//! | 1 MiB        | 21.95 MiB/s        | 51.53 MiB/s             |
 //!
 //! ## concurrent_connections_throughput — via tunnel vs direct baseline
 //! (64 KiB per connection, aggregate across all connections)
 //!
 //! | Connections | Via tunnel (avg/s) | Direct baseline (avg/s) |
 //! |-------------|--------------------|-------------------------|
-//! | 1           | TBD                | TBD                     |
-//! | 4           | TBD                | TBD                     |
-//! | 16          | TBD                | TBD                     |
+//! | 1           | 1.33 MiB/s         | 8.73 MiB/s              |
+//! | 4           | 4.82 MiB/s         | 13.29 MiB/s             |
+//! | 16          | 14.29 MiB/s        | 143.01 MiB/s            |
 //!
 //! The "direct" benchmarks connect straight to the TCP echo server with no
 //! expose-rs server or client in the path, giving a loopback baseline.
