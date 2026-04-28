@@ -9,24 +9,34 @@
 //!
 //! # Measured throughput (optimized build, loopback, same machine)
 //!
-//! ## single_connection_throughput
-//! | Payload size | Throughput (median) |
-//! |--------------|---------------------|
-//! | 16 KiB       | ~195 KiB/s          |
-//! | 256 KiB      | ~5.2 MiB/s          |
-//! | 1 MiB        | ~19 MiB/s           |
+//! ## single_connection_throughput — via tunnel vs direct baseline
 //!
-//! ## concurrent_connections_throughput  (64 KiB per connection, aggregate)
-//! | Connections | Aggregate throughput (median) |
-//! |-------------|-------------------------------|
-//! | 1           | ~1.4 MiB/s                    |
-//! | 4           | ~5.5 MiB/s                    |
-//! | 16          | ~21 MiB/s                     |
+//! | Payload size | Via tunnel (median) | Direct baseline (median) |
+//! |--------------|---------------------|--------------------------|
+//! | 16 KiB       | ~195 KiB/s          | ~113 MiB/s               |
+//! | 256 KiB      | ~6.0 MiB/s          | ~13 MiB/s                |
+//! | 1 MiB        | ~19 MiB/s           | ~27 MiB/s                |
+//!
+//! ## concurrent_connections_throughput — via tunnel vs direct baseline
+//! (64 KiB per connection, aggregate across all connections)
+//!
+//! | Connections | Via tunnel (median) | Direct baseline (median) |
+//! |-------------|---------------------|--------------------------|
+//! | 1           | ~1.5 MiB/s          | ~29 MiB/s                |
+//! | 4           | ~5.1 MiB/s          | ~46 MiB/s                |
+//! | 16          | ~21 MiB/s           | ~482 MiB/s               |
+//!
+//! The "direct" benchmarks connect straight to the TCP echo server with no
+//! expose-rs server or client in the path, giving a loopback baseline.  The
+//! large gap at small payload sizes is dominated by the per-connection WebSocket
+//! handshake latency (~80 ms round-trip overhead per connection through the
+//! tunnel vs ~0.1-2 ms direct).  At larger payloads the gap narrows as
+//! serialisation / framing cost amortises over more bytes.
 //!
 //! Run with:
 //!   cargo bench -p expose-integration-tests
 //!
-//! The benchmarks spin up a full server + client tunnel over loopback and
+//! The tunnel benchmarks spin up a full server + client over loopback and
 //! measure how many bytes per second flow through it.
 
 use std::time::Duration;
@@ -218,9 +228,95 @@ fn bench_concurrent_connections_throughput(c: &mut Criterion) {
     });
 }
 
+// ── Baseline benchmarks (direct connection, no tunnel) ────────────────────────
+
+/// Single-connection throughput over a direct TCP connection to the echo server,
+/// with no expose-rs tunnel in the path.  Used as a baseline to quantify the
+/// overhead introduced by the WebSocket tunnel.
+fn bench_single_connection_throughput_direct(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let echo_addr = rt.block_on(start_echo_server());
+
+    let mut group = c.benchmark_group("single_connection_throughput_direct");
+
+    for &size in &[16 * 1024usize, 256 * 1024, 1024 * 1024] {
+        let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(size).collect();
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{}_bytes", size)),
+            &payload,
+            |b, payload| {
+                b.to_async(&rt).iter(|| async {
+                    let mut stream = TcpStream::connect(echo_addr).await.unwrap();
+                    stream.write_all(payload).await.unwrap();
+
+                    let mut received = vec![0u8; payload.len()];
+                    stream.read_exact(&mut received).await.unwrap();
+                    received
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Concurrent-connection throughput over direct TCP connections, no tunnel.
+fn bench_concurrent_connections_throughput_direct(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let echo_addr = rt.block_on(start_echo_server());
+
+    let mut group = c.benchmark_group("concurrent_connections_throughput_direct");
+
+    const PAYLOAD_SIZE: usize = 64 * 1024;
+    let payload: Vec<u8> = (0u32..).map(|i| (i % 251) as u8).take(PAYLOAD_SIZE).collect();
+
+    for &num_conns in &[1usize, 4, 16] {
+        let total_bytes = (PAYLOAD_SIZE * num_conns) as u64;
+        group.throughput(Throughput::Bytes(total_bytes));
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{}_conns", num_conns)),
+            &(num_conns, payload.clone()),
+            |b, (num_conns, payload)| {
+                let num_conns = *num_conns;
+                b.to_async(&rt).iter(|| async {
+                    let mut handles = Vec::with_capacity(num_conns);
+                    for _ in 0..num_conns {
+                        let p = payload.clone();
+                        handles.push(tokio::spawn(async move {
+                            let mut stream = TcpStream::connect(echo_addr).await.unwrap();
+                            stream.write_all(&p).await.unwrap();
+                            let mut received = vec![0u8; p.len()];
+                            stream.read_exact(&mut received).await.unwrap();
+                            received
+                        }));
+                    }
+                    for h in handles {
+                        h.await.unwrap();
+                    }
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_connection_throughput,
     bench_concurrent_connections_throughput,
+    bench_single_connection_throughput_direct,
+    bench_concurrent_connections_throughput_direct,
 );
 criterion_main!(benches);
