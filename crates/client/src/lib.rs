@@ -284,8 +284,10 @@ async fn proxy_conn(
         while let Some(msg) = data_rx.recv().await {
             match msg {
                 ProxyMsg::Data(payload) => {
-                    let write_result = tcp_tx.write_all(&payload).await;
-                    if write_result.is_err() {
+                    if let Err(e) = tcp_tx.write_all(&payload).await {
+                        error!("Upstream write error for conn {}: {}; notifying server", conn_id, e);
+                        // Tell the server to stop sending DATA for this connection.
+                        let _ = out_tx.send(Frame::close(conn_id).encode());
                         break;
                     }
                     write_ack_count = write_ack_count.saturating_add(1);

@@ -328,7 +328,10 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         while let Some(msg) = rx.recv().await {
             match msg {
                 ProxyMsg::Data(payload) => {
-                    if tcp_tx.write_all(&payload).await.is_err() {
+                    if let Err(e) = tcp_tx.write_all(&payload).await {
+                        error!("TCP write error for conn {}: {}; notifying client", conn_id, e);
+                        // Tell the client to stop sending DATA for this connection.
+                        let _ = tunnel_tx.send(Frame::close(conn_id).encode());
                         break;
                     }
                     ack_batch = ack_batch.saturating_add(1);
