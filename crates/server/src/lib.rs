@@ -2,7 +2,10 @@ use expose_common::{
     acquire_permit, apply_flow_ack, semaphore_for_limit, Frame, ACK_BATCH_SIZE, FRAME_ACK,
     FRAME_CLOSE, FRAME_DATA, FRAME_WRITE_ERROR,
 };
-pub use expose_common::{CapacityConfig, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION};
+pub use expose_common::{
+    CapacityConfig, HeartbeatConfig, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_MAX_MISSED,
+    DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -29,7 +32,7 @@ use tracing::{error, info, warn};
 /// the newly-registered sender of a replacement tunnel.
 struct TunnelState {
     session: u64,
-    tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    tx: Option<mpsc::UnboundedSender<Message>>,
 }
 
 struct AppState {
@@ -37,6 +40,7 @@ struct AppState {
     conn_map: Mutex<HashMap<u32, ConnEntry>>,
     next_id: AtomicU32,
     config: CapacityConfig,
+    heartbeat_config: HeartbeatConfig,
 }
 
 struct ConnEntry {
@@ -55,7 +59,7 @@ enum ProxyMsg {
 }
 
 impl AppState {
-    fn new(config: CapacityConfig) -> Self {
+    fn new(config: CapacityConfig, heartbeat_config: HeartbeatConfig) -> Self {
         AppState {
             tunnel: Mutex::new(TunnelState {
                 session: 0,
@@ -64,6 +68,7 @@ impl AppState {
             conn_map: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             config,
+            heartbeat_config,
         }
     }
 
@@ -74,18 +79,25 @@ impl AppState {
 
 /// Run the expose-rs server on an already-bound listener.
 pub async fn run_server(listener: TcpListener, secret_token: String) {
-    run_server_with_channel_config(listener, secret_token, CapacityConfig::default()).await;
+    run_server_with_channel_config(
+        listener,
+        secret_token,
+        CapacityConfig::default(),
+        HeartbeatConfig::default(),
+    )
+    .await;
 }
 
 pub async fn run_server_with_channel_config(
     listener: TcpListener,
     secret_token: String,
     config: CapacityConfig,
+    heartbeat_config: HeartbeatConfig,
 ) {
     let addr = listener
         .local_addr()
         .unwrap_or_else(|_| "?".parse().unwrap());
-    let state = Arc::new(AppState::new(config));
+    let state = Arc::new(AppState::new(config, heartbeat_config));
     let tunnel_prefix = format!("GET /{} ", secret_token);
 
     info!("expose-server listening on {}", addr);
@@ -140,7 +152,7 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     info!("Tunnel client connected");
 
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<Message>();
 
     // Register this tunnel and record our session ID.
     // Incrementing the session counter atomically (under the lock) lets cleanup
@@ -162,25 +174,77 @@ async fn handle_tunnel(stream: TcpStream, state: Arc<AppState>) {
     state.conn_map.lock().await.clear();
 
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = tunnel_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+        while let Some(msg) = tunnel_rx.recv().await {
+            if ws_tx.send(msg).await.is_err() {
                 break;
             }
         }
         let _ = ws_tx.close().await;
     });
 
-    while let Some(msg_result) = ws_rx.next().await {
-        match msg_result {
-            Ok(Message::Binary(bytes)) => match Frame::decode(&bytes) {
-                Ok(frame) => dispatch_from_tunnel(frame, &state).await,
-                Err(e) => warn!("Bad tunnel frame: {}", e),
-            },
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(e) => {
-                error!("Tunnel WebSocket error: {}", e);
-                break;
+    // ── Heartbeat setup ───────────────────────────────────────────────────────
+    let heartbeat_config = state.heartbeat_config;
+    let missed_pongs = Arc::new(AtomicU32::new(0));
+    let (hb_close_tx, hb_close_rx) = watch::channel(false);
+
+    let heartbeat_enabled = !heartbeat_config.interval.is_zero();
+    if heartbeat_enabled {
+        // Retrieve the tunnel sender from state to send pings through the writer task.
+        let tunnel_tx_hb = {
+            let guard = state.tunnel.lock().await;
+            guard.tx.clone()
+        };
+        if let Some(tunnel_tx_hb) = tunnel_tx_hb {
+            let missed_pongs_hb = Arc::clone(&missed_pongs);
+            let hb_close_tx_hb = hb_close_tx.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(heartbeat_config.interval);
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    let missed = missed_pongs_hb.fetch_add(1, Ordering::Relaxed) + 1;
+                    if missed > heartbeat_config.max_missed {
+                        warn!(
+                            "Heartbeat timeout: {} consecutive missed pongs (max {}), closing tunnel",
+                            missed, heartbeat_config.max_missed
+                        );
+                        let _ = hb_close_tx_hb.send(true);
+                        break;
+                    }
+                    if tunnel_tx_hb.send(Message::Ping(vec![])).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    let mut hb_close_rx = hb_close_rx;
+
+    loop {
+        tokio::select! {
+            _ = hb_close_rx.changed(), if heartbeat_enabled => {
+                if *hb_close_rx.borrow() {
+                    break;
+                }
+            }
+            msg_result = ws_rx.next() => {
+                match msg_result {
+                    Some(Ok(Message::Binary(bytes))) => match Frame::decode(&bytes) {
+                        Ok(frame) => dispatch_from_tunnel(frame, &state).await,
+                        Err(e) => warn!("Bad tunnel frame: {}", e),
+                    },
+                    Some(Ok(Message::Pong(_))) => {
+                        missed_pongs.store(0, Ordering::Relaxed);
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        error!("Tunnel WebSocket error: {}", e);
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
     }
@@ -297,7 +361,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         },
     );
 
-    if tunnel_tx.send(Frame::open(conn_id).encode()).is_err() {
+    if tunnel_tx.send(Message::Binary(Frame::open(conn_id).encode())).is_err() {
         state.conn_map.lock().await.remove(&conn_id);
         return;
     }
@@ -339,7 +403,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                             break 'reader;
                         }
                         Ok(n) => {
-                            let frame = Frame::data(conn_id, buf[..n].to_vec()).encode();
+                            let frame = Message::Binary(Frame::data(conn_id, buf[..n].to_vec()).encode());
                             // Forget the permit only after the send succeeds so credits
                             // are not permanently lost when the channel has already closed.
                             if tunnel_tx_clone.send(frame).is_err() {
@@ -363,7 +427,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         // peer write-error signal the peer already knows — sending FRAME_CLOSE
         // would be confusing and redundant.
         if !stopped_by_peer_error {
-            let _ = tunnel_tx_clone.send(Frame::close(conn_id).encode());
+            let _ = tunnel_tx_clone.send(Message::Binary(Frame::close(conn_id).encode()));
         }
     });
 
@@ -382,12 +446,12 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                         // do NOT abort the reader or remove conn_id from conn_map
                         // here — the reader keeps running and conn_map is cleaned up
                         // after both tasks finish.
-                        let _ = tunnel_tx.send(Frame::write_error(conn_id).encode());
+                        let _ = tunnel_tx.send(Message::Binary(Frame::write_error(conn_id).encode()));
                         break;
                     }
                     ack_batch = ack_batch.saturating_add(1);
                     if ack_batch >= ACK_BATCH_SIZE {
-                        let _ = tunnel_tx.send(Frame::ack(conn_id, ack_batch).encode());
+                        let _ = tunnel_tx.send(Message::Binary(Frame::ack(conn_id, ack_batch).encode()));
                         ack_batch = 0;
                     }
                 }
@@ -395,7 +459,7 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
             }
         }
         if ack_batch > 0 {
-            let _ = tunnel_tx.send(Frame::ack(conn_id, ack_batch).encode());
+            let _ = tunnel_tx.send(Message::Binary(Frame::ack(conn_id, ack_batch).encode()));
         }
         let _ = tcp_tx.shutdown().await;
     });

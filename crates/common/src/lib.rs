@@ -3,7 +3,8 @@ use std::io;
 pub mod capacity;
 
 pub use capacity::{
-    acquire_permit, apply_flow_ack, semaphore_for_limit, CapacityConfig, ACK_BATCH_SIZE,
+    acquire_permit, apply_flow_ack, semaphore_for_limit, CapacityConfig, HeartbeatConfig,
+    ACK_BATCH_SIZE, DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_MAX_MISSED,
     DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
 };
 

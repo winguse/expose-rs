@@ -57,6 +57,7 @@ async fn start_tunnel(
         server_listener,
         secret.clone(),
         expose_server::CapacityConfig::default(),
+        expose_server::HeartbeatConfig::default(),
     ));
 
     // Give the server a moment to enter its accept loop.
@@ -67,6 +68,7 @@ async fn start_tunnel(
         ws_url,
         upstream.to_string(),
         expose_client::CapacityConfig::default(),
+        expose_client::HeartbeatConfig::default(),
     ));
 
     (server_addr, server_task, client_task)
@@ -330,6 +332,7 @@ async fn test_tunnel_reconnect_cleanup_race() {
         server_listener,
         secret.clone(),
         expose_server::CapacityConfig::default(),
+        expose_server::HeartbeatConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -340,6 +343,7 @@ async fn test_tunnel_reconnect_cleanup_race() {
         ws_url.clone(),
         upstream.to_string(),
         expose_client::CapacityConfig::default(),
+        expose_client::HeartbeatConfig::default(),
     ));
     wait_until_tunnel_ready(server_addr).await;
 
@@ -348,6 +352,7 @@ async fn test_tunnel_reconnect_cleanup_race() {
         ws_url.clone(),
         upstream.to_string(),
         expose_client::CapacityConfig::default(),
+        expose_client::HeartbeatConfig::default(),
     ));
     // Give B time to complete the WebSocket handshake with the server before
     // we abort A.  150 ms is ample for a loopback WS handshake.
@@ -401,6 +406,7 @@ async fn test_upstream_refused() {
         server_listener,
         secret.clone(),
         expose_server::CapacityConfig::default(),
+        expose_server::HeartbeatConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -409,6 +415,7 @@ async fn test_upstream_refused() {
         ws_url,
         refused_addr.to_string(),
         expose_client::CapacityConfig::default(),
+        expose_client::HeartbeatConfig::default(),
     ));
     // Wait for the WebSocket handshake to complete.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -455,6 +462,7 @@ async fn test_flow_control_small_limit() {
         expose_server::CapacityConfig {
             max_pending_messages_per_connection: limit,
         },
+        expose_server::HeartbeatConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -465,6 +473,7 @@ async fn test_flow_control_small_limit() {
         expose_client::CapacityConfig {
             max_pending_messages_per_connection: limit,
         },
+        expose_client::HeartbeatConfig::default(),
     ));
 
     wait_until_tunnel_ready(server_addr).await;
@@ -722,6 +731,7 @@ async fn test_client_write_error_propagated_to_server() {
         server_listener,
         secret.clone(),
         expose_server::CapacityConfig::default(),
+        expose_server::HeartbeatConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -730,6 +740,7 @@ async fn test_client_write_error_propagated_to_server() {
         ws_url,
         upstream_addr.to_string(),
         expose_client::CapacityConfig::default(),
+        expose_client::HeartbeatConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -790,4 +801,76 @@ async fn test_server_write_error_propagated_to_client() {
 
     server_task.abort();
     client_task.abort();
+}
+
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+
+/// When the heartbeat interval is very short and the client stops sending pongs
+/// (simulated by aborting the client task), the server-side heartbeat detects
+/// the missing pongs and closes the tunnel.  A new client can then reconnect.
+#[tokio::test]
+async fn test_heartbeat_closes_dead_tunnel() {
+    let upstream = start_echo_server().await;
+    let secret = "heartbeat-secret".to_string();
+
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+
+    // Use a very short heartbeat interval so the test completes quickly.
+    let server_hb = expose_server::HeartbeatConfig {
+        interval: Duration::from_millis(100),
+        max_missed: 2,
+    };
+
+    let server_task = tokio::spawn(expose_server::run_server_with_channel_config(
+        server_listener,
+        secret.clone(),
+        expose_server::CapacityConfig::default(),
+        server_hb,
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let ws_url = format!("ws://{}/{}", server_addr, secret);
+
+    // Phase 1: Connect client A and wait until the tunnel is ready.
+    let client_a_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url.clone(),
+        upstream.to_string(),
+        expose_client::CapacityConfig::default(),
+        // Disable client-side heartbeat so A never sends pings itself; the
+        // server will still ping A and expect pongs.
+        expose_client::HeartbeatConfig {
+            interval: Duration::ZERO, // disabled — A receives pings but still sends pongs
+            max_missed: 0,
+        },
+    ));
+    wait_until_tunnel_ready(server_addr).await;
+
+    // Abort client A — it can no longer send pongs.  The server should detect
+    // max_missed consecutive missed pongs and close the tunnel.
+    // Timeout = interval × (max_missed + 1) = 100 ms × 3 = 300 ms.
+    client_a_task.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Phase 2: Connect a new client B; the server must accept it cleanly.
+    let client_b_task = tokio::spawn(expose_client::run_client_once_with_channel_config(
+        ws_url.clone(),
+        upstream.to_string(),
+        expose_client::CapacityConfig::default(),
+        expose_client::HeartbeatConfig::default(),
+    ));
+
+    wait_until_tunnel_ready(server_addr).await;
+
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+    stream.write_all(b"post-heartbeat").await.unwrap();
+    let mut buf = vec![0u8; 14];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("read timed out after heartbeat reconnect")
+        .expect("read failed after heartbeat reconnect");
+    assert_eq!(&buf, b"post-heartbeat");
+
+    server_task.abort();
+    client_b_task.abort();
 }
