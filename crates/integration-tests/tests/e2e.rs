@@ -838,9 +838,9 @@ async fn test_heartbeat_closes_dead_tunnel() {
         upstream.to_string(),
         expose_client::CapacityConfig::default(),
         // Disable client-side heartbeat so A never sends pings itself; the
-        // server will still ping A and expect pongs.
+        // server will still ping A and A will pong while it is alive.
         expose_client::HeartbeatConfig {
-            interval: Duration::ZERO, // disabled — A receives pings but still sends pongs
+            interval: Duration::ZERO, // disabled — A sends pongs while running
             max_missed: 0,
         },
     ));
@@ -848,7 +848,7 @@ async fn test_heartbeat_closes_dead_tunnel() {
 
     // Abort client A — it can no longer send pongs.  The server should detect
     // max_missed consecutive missed pongs and close the tunnel.
-    // Timeout = interval × (max_missed + 1) = 100 ms × 3 = 300 ms.
+    // Timeout ≈ interval × (max_missed + 1) = 100 ms × 3 = 300 ms.
     client_a_task.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
