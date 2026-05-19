@@ -361,7 +361,10 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
         },
     );
 
-    if tunnel_tx.send(Message::Binary(Frame::open(conn_id).encode())).is_err() {
+    if tunnel_tx
+        .send(Message::Binary(Frame::open(conn_id).encode()))
+        .is_err()
+    {
         state.conn_map.lock().await.remove(&conn_id);
         return;
     }
@@ -446,12 +449,14 @@ async fn handle_proxy(stream: TcpStream, state: Arc<AppState>) {
                         // do NOT abort the reader or remove conn_id from conn_map
                         // here — the reader keeps running and conn_map is cleaned up
                         // after both tasks finish.
-                        let _ = tunnel_tx.send(Message::Binary(Frame::write_error(conn_id).encode()));
+                        let _ =
+                            tunnel_tx.send(Message::Binary(Frame::write_error(conn_id).encode()));
                         break;
                     }
                     ack_batch = ack_batch.saturating_add(1);
                     if ack_batch >= ACK_BATCH_SIZE {
-                        let _ = tunnel_tx.send(Message::Binary(Frame::ack(conn_id, ack_batch).encode()));
+                        let _ = tunnel_tx
+                            .send(Message::Binary(Frame::ack(conn_id, ack_batch).encode()));
                         ack_batch = 0;
                     }
                 }

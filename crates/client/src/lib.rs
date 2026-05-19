@@ -228,8 +228,7 @@ async fn handle_frame(
                             upstream, conn_id, e
                         );
                         conn_map_clone.lock().await.remove(&conn_id);
-                        let _ = out_tx_clone
-                            .send(Message::Binary(Frame::close(conn_id).encode()));
+                        let _ = out_tx_clone.send(Message::Binary(Frame::close(conn_id).encode()));
                     }
                 }
             });
@@ -407,7 +406,9 @@ async fn proxy_conn(
                     }
                     write_ack_count = write_ack_count.saturating_add(1);
                     if write_ack_count >= ACK_BATCH_SIZE {
-                        let _ = out_tx.send(Message::Binary(Frame::ack(conn_id, write_ack_count).encode()));
+                        let _ = out_tx.send(Message::Binary(
+                            Frame::ack(conn_id, write_ack_count).encode(),
+                        ));
                         write_ack_count = 0;
                     }
                 }
@@ -415,7 +416,9 @@ async fn proxy_conn(
             }
         }
         if write_ack_count > 0 {
-            let _ = out_tx.send(Message::Binary(Frame::ack(conn_id, write_ack_count).encode()));
+            let _ = out_tx.send(Message::Binary(
+                Frame::ack(conn_id, write_ack_count).encode(),
+            ));
         }
         let _ = tcp_tx.shutdown().await;
     });
