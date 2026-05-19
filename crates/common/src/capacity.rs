@@ -2,10 +2,15 @@
 //! that sends DATA toward the tunnel uses `acquire_permit` → `forget` per chunk, and
 //! restores credits only when the peer ACKs after writing to its local TCP.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION: usize = 256;
+
+/// Default interval between WebSocket ping frames sent for heartbeating.
+pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 15;
+/// Default number of consecutive missed pongs before the connection is closed.
+pub const DEFAULT_HEARTBEAT_MAX_MISSED: u32 = 2;
 
 /// Batch ACK frames to reduce tunnel overhead (client and server writers).
 ///
@@ -25,6 +30,28 @@ impl Default for CapacityConfig {
     fn default() -> Self {
         Self {
             max_pending_messages_per_connection: DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
+        }
+    }
+}
+
+/// Configuration for the WebSocket heartbeat (ping/pong) mechanism.
+///
+/// Both the client and the server send a ping every `interval`.  If no pong
+/// is received for `max_missed` consecutive pings the connection is closed.
+/// Set `interval` to `Duration::ZERO` to disable heartbeating entirely.
+#[derive(Clone, Copy, Debug)]
+pub struct HeartbeatConfig {
+    /// How often to send a WebSocket ping frame.  `Duration::ZERO` disables heartbeats.
+    pub interval: Duration,
+    /// How many consecutive missed pongs trigger a connection close.
+    pub max_missed: u32,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
+            max_missed: DEFAULT_HEARTBEAT_MAX_MISSED,
         }
     }
 }

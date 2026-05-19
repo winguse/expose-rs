@@ -3,10 +3,17 @@ use expose_common::{
     FRAME_OPEN, FRAME_WRITE_ERROR,
 };
 pub use expose_common::{
-    CapacityConfig, ACK_BATCH_SIZE, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
+    CapacityConfig, HeartbeatConfig, ACK_BATCH_SIZE, DEFAULT_HEARTBEAT_INTERVAL_SECS,
+    DEFAULT_HEARTBEAT_MAX_MISSED, DEFAULT_MAX_PENDING_MESSAGES_PER_CONNECTION,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -39,20 +46,27 @@ enum ProxyMsg {
 /// Returns when the WebSocket connection to the server is closed (or fails).
 /// Does **not** reconnect; the caller is responsible for retry logic.
 pub async fn run_client_once(server_url: String, upstream: String) {
-    run_client_once_with_channel_config(server_url, upstream, CapacityConfig::default()).await;
+    run_client_once_with_channel_config(
+        server_url,
+        upstream,
+        CapacityConfig::default(),
+        HeartbeatConfig::default(),
+    )
+    .await;
 }
 
 /// Connect to the expose-rs server once and relay connections to `upstream`,
-/// using explicit per-connection in-flight limits.
+/// using explicit per-connection in-flight limits and heartbeat settings.
 pub async fn run_client_once_with_channel_config(
     server_url: String,
     upstream: String,
     channel_config: CapacityConfig,
+    heartbeat_config: HeartbeatConfig,
 ) {
     match connect_async(&server_url).await {
         Ok((ws, _)) => {
             info!("Connected to server at {}", server_url);
-            run_client(ws, upstream, channel_config).await;
+            run_client(ws, upstream, channel_config, heartbeat_config).await;
         }
         Err(e) => {
             error!("Failed to connect to {}: {}", server_url, e);
@@ -68,14 +82,15 @@ async fn run_client(
     >,
     upstream: String,
     channel_config: CapacityConfig,
+    heartbeat_config: HeartbeatConfig,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    // Single outgoing channel for all frames (ACKs, CLOSE, DATA).
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Single outgoing channel for all messages (ACKs, CLOSE, DATA, Ping).
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = out_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+        while let Some(msg) = out_rx.recv().await {
+            if ws_tx.send(msg).await.is_err() {
                 break;
             }
         }
@@ -84,26 +99,74 @@ async fn run_client(
 
     let conn_map: ConnMap = Arc::new(Mutex::new(HashMap::new()));
 
-    while let Some(msg_result) = ws_rx.next().await {
-        match msg_result {
-            Ok(Message::Binary(bytes)) => match Frame::decode(&bytes) {
-                Ok(frame) => {
-                    handle_frame(
-                        frame,
-                        out_tx.clone(),
-                        upstream.clone(),
-                        Arc::clone(&conn_map),
-                        channel_config,
-                    )
-                    .await;
+    // ── Heartbeat setup ───────────────────────────────────────────────────────
+    // `missed_pongs` counts how many pings have been sent without a matching pong.
+    // Reset to 0 on every Pong received; incremented by the heartbeat task before
+    // each ping.  If it exceeds `max_missed` the task signals a close.
+    let missed_pongs = Arc::new(AtomicU32::new(0));
+    let (hb_close_tx, hb_close_rx) = watch::channel(false);
+
+    let heartbeat_enabled = !heartbeat_config.interval.is_zero();
+    if heartbeat_enabled {
+        let out_tx_hb = out_tx.clone();
+        let missed_pongs_hb = Arc::clone(&missed_pongs);
+        let hb_close_tx_hb = hb_close_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(heartbeat_config.interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let missed = missed_pongs_hb.fetch_add(1, Ordering::Relaxed) + 1;
+                if missed > heartbeat_config.max_missed {
+                    warn!(
+                        "Heartbeat timeout: {} consecutive missed pongs (max {}), closing connection",
+                        missed, heartbeat_config.max_missed
+                    );
+                    let _ = hb_close_tx_hb.send(true);
+                    break;
                 }
-                Err(e) => warn!("Bad frame from server: {}", e),
-            },
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(e) => {
-                error!("WebSocket error: {}", e);
-                break;
+                if out_tx_hb.send(Message::Ping(vec![])).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let mut hb_close_rx = hb_close_rx;
+
+    loop {
+        tokio::select! {
+            _ = hb_close_rx.changed(), if heartbeat_enabled => {
+                if *hb_close_rx.borrow() {
+                    break;
+                }
+            }
+            msg_result = ws_rx.next() => {
+                match msg_result {
+                    Some(Ok(Message::Binary(bytes))) => match Frame::decode(&bytes) {
+                        Ok(frame) => {
+                            handle_frame(
+                                frame,
+                                out_tx.clone(),
+                                upstream.clone(),
+                                Arc::clone(&conn_map),
+                                channel_config,
+                            )
+                            .await;
+                        }
+                        Err(e) => warn!("Bad frame from server: {}", e),
+                    },
+                    Some(Ok(Message::Pong(_))) => {
+                        missed_pongs.store(0, Ordering::Relaxed);
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        error!("WebSocket error: {}", e);
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
     }
@@ -116,7 +179,7 @@ async fn run_client(
 
 async fn handle_frame(
     frame: Frame,
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    out_tx: mpsc::UnboundedSender<Message>,
     upstream: String,
     conn_map: ConnMap,
     channel_config: CapacityConfig,
@@ -165,7 +228,7 @@ async fn handle_frame(
                             upstream, conn_id, e
                         );
                         conn_map_clone.lock().await.remove(&conn_id);
-                        let _ = out_tx_clone.send(Frame::close(conn_id).encode());
+                        let _ = out_tx_clone.send(Message::Binary(Frame::close(conn_id).encode()));
                     }
                 }
             });
@@ -253,7 +316,7 @@ async fn proxy_conn(
     conn_id: u32,
     stream: TcpStream,
     mut data_rx: mpsc::UnboundedReceiver<ProxyMsg>,
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    out_tx: mpsc::UnboundedSender<Message>,
     conn_map: ConnMap,
     // Semaphore passed in directly so the reader does not need to lock conn_map
     // on every iteration just to retrieve an immutable Arc clone.
@@ -297,7 +360,7 @@ async fn proxy_conn(
                             break 'reader;
                         }
                         Ok(n) => {
-                            let bytes = Frame::data(conn_id, buf[..n].to_vec()).encode();
+                            let bytes = Message::Binary(Frame::data(conn_id, buf[..n].to_vec()).encode());
                             // Forget the permit only after the send succeeds so credits
                             // are not permanently lost when the channel has already closed.
                             if out_tx_clone.send(bytes).is_err() {
@@ -321,7 +384,7 @@ async fn proxy_conn(
         // peer write-error signal the peer already knows — sending FRAME_CLOSE
         // would be confusing and redundant.
         if !stopped_by_peer_error {
-            let _ = out_tx_clone.send(Frame::close(conn_id).encode());
+            let _ = out_tx_clone.send(Message::Binary(Frame::close(conn_id).encode()));
         }
     });
 
@@ -338,12 +401,14 @@ async fn proxy_conn(
                         // do NOT abort the reader or remove conn_id from conn_map
                         // here — the reader keeps running and conn_map is cleaned up
                         // after both tasks finish.
-                        let _ = out_tx.send(Frame::write_error(conn_id).encode());
+                        let _ = out_tx.send(Message::Binary(Frame::write_error(conn_id).encode()));
                         break;
                     }
                     write_ack_count = write_ack_count.saturating_add(1);
                     if write_ack_count >= ACK_BATCH_SIZE {
-                        let _ = out_tx.send(Frame::ack(conn_id, write_ack_count).encode());
+                        let _ = out_tx.send(Message::Binary(
+                            Frame::ack(conn_id, write_ack_count).encode(),
+                        ));
                         write_ack_count = 0;
                     }
                 }
@@ -351,7 +416,9 @@ async fn proxy_conn(
             }
         }
         if write_ack_count > 0 {
-            let _ = out_tx.send(Frame::ack(conn_id, write_ack_count).encode());
+            let _ = out_tx.send(Message::Binary(
+                Frame::ack(conn_id, write_ack_count).encode(),
+            ));
         }
         let _ = tcp_tx.shutdown().await;
     });
