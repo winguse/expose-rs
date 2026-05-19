@@ -171,8 +171,8 @@ jobs:
           registry: ghcr.io
           # Prefer a dedicated PAT when available because GHCR package-level
           # permissions can deny GITHUB_TOKEN writes for existing packages.
-          username: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_USERNAME || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels)
         id: meta
